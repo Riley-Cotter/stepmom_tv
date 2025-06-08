@@ -2,7 +2,7 @@ from flask import Flask, render_template
 import subprocess
 import os
 
-app = Flask(__name__, template_folder='templates')
+app = Flask(__name__, template_folder='/home/ri/stepmom_tv/')
 
 MQTT_BROKER = "192.168.50.1"
 MQTT_TOPIC = "video/request_play"
