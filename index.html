@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>stepmom tv</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Comic+Neue:wght@700&display=swap');
+
+    body {
+      background-color: #ffe4e6; /* light pink */
+      font-family: 'Comic Neue', cursive, sans-serif;
+      color: #4a004a;
+      margin: 20px;
+    }
+
+    h1 {
+      text-align: center;
+      font-size: 3em;
+      margin-bottom: 20px;
+    }
+
+    .video-buttons {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      max-width: 200px;
+      margin: 0 auto 40px auto;
+    }
+
+    button {
+      background-color: #ff66b2; /* dark pink */
+      color: white;
+      font-size: 1.5rem;
+      padding: 12px 0;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: background-color 0.3s ease;
+      user-select: none;
+    }
+
+    button:active {
+      background-color: #cc1a66 !important;
+    }
+
+    .clients-section {
+      max-width: 300px;
+      margin: 0 auto;
+      text-align: center;
+      font-size: 1.2rem;
+    }
+
+    .clients-section h3 {
+      margin-bottom: 8px;
+    }
+
+    ul.client-list {
+      list-style-type: none;
+      padding: 0;
+      margin: 0;
+      color: #80004d;
+    }
+
+    ul.client-list li {
+      margin: 4px 0;
+    }
+
+    /* Confetti styles */
+    .confetti-piece {
+      position: fixed;
+      width: 10px;
+      height: 10px;
+      background-color: #ff66b2;
+      animation: fall 1s linear forwards;
+      z-index: 1000;
+      border-radius: 50%;
+      pointer-events: none;
+    }
+
+    @keyframes fall {
+      0% { transform: translateY(0) rotate(0deg); opacity: 1; }
+      100% { transform: translateY(100vh) rotate(360deg); opacity: 0; }
+    }
+  </style>
+</head>
+<body>
+  <h1>stepmom tv</h1>
+
+  <div class="video-buttons" id="video-buttons">
+    <!-- Buttons will be inserted here dynamically by JS -->
+  </div>
+
+  <div class="clients-section">
+    <h3>Connected Clients:</h3>
+    <div id="client-list">Loading...</div>
+  </div>
+
+  <script>
+    // Video buttons count (adjust as needed)
+    const videoCount = 10;
+
+    const videoButtonsContainer = document.getElementById('video-buttons');
+
+    function createButton(index) {
+      const btn = document.createElement('button');
+      btn.textContent = `Video ${index}`;
+      btn.dataset.index = index;
+      btn.addEventListener('click', () => {
+        sendPlayRequest(index, btn);
+      });
+      return btn;
+    }
+
+    // Create video buttons
+    for(let i = 0; i < videoCount; i++) {
+      videoButtonsContainer.appendChild(createButton(i));
+    }
+
+    async function sendPlayRequest(index, button) {
+      // Highlight button dark pink for 1 second + confetti animation
+      const originalColor = button.style.backgroundColor;
+      button.style.backgroundColor = '#cc1a66';
+
+      createConfetti();
+
+      try {
+        await fetch(`/play/${index}`, { method: 'POST' });
+      } catch (e) {
+        console.error('Failed to send play request', e);
+      }
+
+      setTimeout(() => {
+        button.style.backgroundColor = '#ff66b2';
+      }, 1000);
+    }
+
+    // Confetti animation function
+    function createConfetti() {
+      for(let i = 0; i < 20; i++) {
+        const confetti = document.createElement('div');
+        confetti.classList.add('confetti-piece');
+        confetti.style.left = `${Math.random() * window.innerWidth}px`;
+        confetti.style.backgroundColor = `hsl(${Math.random() * 360}, 100%, 70%)`;
+        document.body.appendChild(confetti);
+        setTimeout(() => confetti.remove(), 1000);
+      }
+    }
+
+    // Fetch and update client list every 5 seconds
+    async function updateClientList() {
+      try {
+        const res = await fetch('http://192.168.50.1:5000/clients');
+        const clients = await res.json();
+
+        const clientListDiv = document.getElementById('client-list');
+        if (clients.length === 0) {
+          clientListDiv.textContent = 'No clients connected';
+        } else {
+          const ul = document.createElement('ul');
+          ul.className = 'client-list';
+          clients.forEach(client => {
+            const li = document.createElement('li');
+            li.textContent = client;
+            ul.appendChild(li);
+          });
+          clientListDiv.innerHTML = '';
+          clientListDiv.appendChild(ul);
+        }
+      } catch (e) {
+        document.get
