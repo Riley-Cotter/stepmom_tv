@@ -16,9 +16,9 @@ Raspberry Pi Seutp:
   2.	Add Program to Startup
     a.	sudo crontab -e
     b.	For Client
-      i.	@reboot /bin/sleep 1; /home/ri/startup_client.sh > /home/ri/mycronlog.txt 2>&1
+      i.	@reboot /bin/sleep 1; /home/ri/stepmom_tv/startup_client.sh > /home/ri/mycronlog.txt 2>&1
     c.	For Brain
-      i.	@reboot /bin/sleep 1; /home/ri/startup_brain.sh  > /home/ri/mycronlog.txt 2>&1
+      i.	@reboot /bin/sleep 1; /home/ri/stepmom_tv/startup_brain.sh  > /home/ri/mycronlog.txt 2>&1
   3.	Give Scripts Permission to be Executable
     a.	sudo chmod +x setup
   4.	Run Setup
