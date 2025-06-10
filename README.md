@@ -1,6 +1,6 @@
 1.	For Windows
   a.	Download Ubuntu (Windows Subsystem for Linux)
-Raspberry Pi Seutp:
+Raspberry Pi Setup:
   1. Install Lite OS (using the raspberry pi imager)
     b.	For Client
       i.	Set Hostname: sub#
@@ -25,12 +25,13 @@ Raspberry Pi Seutp:
     c.	For Brain
       i.	@reboot /bin/sleep 1; /home/ri/stepmom_tv/startup_brain.sh  > /home/ri/mycronlog.txt 2>&1
   4. Give Scripts Permission to be Executable
-    a.	sudo chmod +x setup
+    a.	sudo chmod +x /home/ri/stepmom_tv/setup.sh
   5. Run Setup
-    a.	sudo ./setup
+    a.	sudo ./setup.sh
   6. Sudo raspi-config
     a.	Navigate to display settings, choose composite
-    Test with:  mosquitto_pub -h 192.168.50.1 -t video/request_play -m 2,5
+    
+
     Server setup on Brain
   7. For Server: Setup Wifi: https://www.youtube.com/watch?v=rjHz6tXGYxQ
     a.	sudo apt install iptables
@@ -62,3 +63,6 @@ Raspberry Pi Seutp:
         14.	US
       iii.	Save and Restart
         1.	Should have 3 solid green circles up top.
+
+Useful Scripts:
+    Test with:  mosquitto_pub -h 192.168.50.1 -t video/request_play -m 2,5
