@@ -1,7 +1,7 @@
 1.	For Windows
   a.	Download Ubuntu (Windows Subsystem for Linux)
 Raspberry Pi Seutp:
-  1.	Install Lite OS (using the raspberry pi imager)
+  1. Install Lite OS (using the raspberry pi imager)
     b.	For Client
       i.	Set Hostname: sub#
       ii.	Include WIFI 
@@ -13,21 +13,26 @@ Raspberry Pi Seutp:
         1.	Username: LocalWIFIUsername
         2.	Password: #LocalPassword
     d.	Enable SSH
-  2.	Add Program to Startup
+  2. Clone Repository to RaspberryPi
+    a. Install Git
+        i. sudo apt install git
+    b. Clone Repo
+        i. git clone https://github.com/Riley-Cotter/stepmom_tv.git
+  3. Add Program to Startup
     a.	sudo crontab -e
     b.	For Client
       i.	@reboot /bin/sleep 1; /home/ri/stepmom_tv/startup_client.sh > /home/ri/mycronlog.txt 2>&1
     c.	For Brain
       i.	@reboot /bin/sleep 1; /home/ri/stepmom_tv/startup_brain.sh  > /home/ri/mycronlog.txt 2>&1
-  3.	Give Scripts Permission to be Executable
+  4. Give Scripts Permission to be Executable
     a.	sudo chmod +x setup
-  4.	Run Setup
+  5. Run Setup
     a.	sudo ./setup
-  5.	Sudo raspi-config
+  6. Sudo raspi-config
     a.	Navigate to display settings, choose composite
     Test with:  mosquitto_pub -h 192.168.50.1 -t video/request_play -m 2,5
     Server setup on Brain
-  6.	For Server: Setup Wifi: https://www.youtube.com/watch?v=rjHz6tXGYxQ
+  7. For Server: Setup Wifi: https://www.youtube.com/watch?v=rjHz6tXGYxQ
     a.	sudo apt install iptables
     b.	sudo update-alternatives --set iptables /usr/sbin/iptables-legacy
     c.	sudo update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
