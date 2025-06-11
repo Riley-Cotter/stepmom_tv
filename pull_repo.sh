@@ -1,16 +1,25 @@
 #!/bin/bash
 
-# Change to your project directory
-cd /home/ri/stepmom_tv || {
-    echo "Failed to enter project directory"
+# Wait for network and filesystem to be ready
+sleep 10
+
+REPO_DIR="/home/ri/stepmom_tv"
+
+# Add repo as a safe Git directory (prevents "dubious ownership" error)
+git config --global --add safe.directory "$REPO_DIR"
+
+# Change to repo directory
+cd "$REPO_DIR" || {
+    echo "Failed to enter project directory: $REPO_DIR"
     exit 1
 }
 
-# Reset local changes and pull latest from GitHub
+# Reset local changes and pull latest code
 git reset --hard
 git pull origin main
 
 # Make key scripts executable
 chmod +x startup_brain.sh startup_client.sh
 
-echo "Update complete at $(date)" >> /home/ri/update_code.log 
+# Log completion
+echo "Update complete at $(date)" >> /home/ri/update_code.log
