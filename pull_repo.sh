@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Change to your project directory
-cd /home/pi/stepmom_tv || {
+cd /home/ri/stepmom_tv || {
     echo "Failed to enter project directory"
     exit 1
 }
