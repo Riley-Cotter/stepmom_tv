@@ -71,3 +71,4 @@ Useful Scripts:
         cd stepmom_tv
         git reset --hard
         git pull origin main
+        cd

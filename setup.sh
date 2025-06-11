@@ -12,9 +12,7 @@ sudo apt install -y python3-paho-mqtt
 sudo apt install -y python3-vlc
 sudo apt install -y python3-flask
 
-#Set code to executable
-sudo chmod +x /home/ri/stepmom_tv/mount_usb*
-sudo chmod +x /home/ri/stepmom_tv/startup_client*
-sudo chmod +x /home/ri/stepmom_tv/startup_brain*
+#Set shell scripts code to executable
+chmod +x /home/ri/stepmom_tv/*.sh
 
 echo "[✔] Setup Complete"
