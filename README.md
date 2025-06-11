@@ -73,4 +73,4 @@ Useful Scripts:
         git pull origin main
         cd
 
-    TEST
+    TEST DONE
