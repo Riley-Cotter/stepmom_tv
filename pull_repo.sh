@@ -13,4 +13,4 @@ git pull origin main
 # Make key scripts executable
 chmod +x startup_brain.sh startup_client.sh
 
-echo "Update complete at $(date)" >> /home/pi/update_code.log 
+echo "Update complete at $(date)" >> /home/ri/update_code.log 
