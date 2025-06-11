@@ -67,7 +67,7 @@ Raspberry Pi Setup:
 Useful Scripts:
     Test with:  mosquitto_pub -h 192.168.50.1 -t video/request_play -m 2,5
 
-    Update Code with
+    Update On reboot or use code:
         cd stepmom_tv
         git reset --hard
         git pull origin main
