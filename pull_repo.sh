@@ -1,8 +1,5 @@
 #!/bin/bash
 
-# Wait for network and filesystem to be ready
-sleep 10
-
 REPO_DIR="/home/ri/stepmom_tv"
 
 # Add repo as a safe Git directory (prevents "dubious ownership" error)
