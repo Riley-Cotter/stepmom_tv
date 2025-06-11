@@ -13,11 +13,8 @@ sudo apt install -y python3-vlc
 sudo apt install -y python3-flask
 
 #Set code to executable
+sudo chmod +x /home/ri/stepmom_tv/mount_usb*
 sudo chmod +x /home/ri/stepmom_tv/startup_client*
 sudo chmod +x /home/ri/stepmom_tv/startup_brain*
-sudo chmod +x /home/ri/stepmom_tv/background_image*
-sudo chmod +x /home/ri/stepmom_tv/video_player_brain*
-sudo chmod +x /home/ri/stepmom_tv/video_player_client*
-sudo chmod +x /home/ri/stepmom_tv/web_controller*
 
 echo "[✔] Setup Complete"

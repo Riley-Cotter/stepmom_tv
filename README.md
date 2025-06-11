@@ -69,4 +69,5 @@ Useful Scripts:
 
     Update Code with
         cd stepmom_tv
+        git reset --hard
         git pull origin main
