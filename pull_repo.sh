@@ -19,7 +19,7 @@ git reset --hard
 git pull origin main
 
 # Make key scripts executable
-chmod +x startup_brain.sh startup_client.sh
+chmod +x *.sh
 
 # Log completion
 echo "Update complete at $(date)" >> /home/ri/update_code.log
