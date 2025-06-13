@@ -1,188 +1,92 @@
 import os
 import time
-import threading
 import paho.mqtt.client as mqtt
 import vlc
+import threading
+import uuid
 
-# Configuration
+# Config
 VIDEO_DIR = "/media/usb"
 MQTT_BROKER = "192.168.50.1"
-MQTT_TOPIC_PLAY = "video/play"  # Client listens here for play commands
-MQTT_TOPIC_TIME_REQUEST = "sync/time/request"
-MQTT_TOPIC_TIME_RESPONSE = "sync/time"
-MQTT_TOPIC_HEARTBEAT = "clients/heartbeat"  # Optional
+MQTT_TOPIC_PLAY = "video/play"
+MQTT_TOPIC_HEARTBEAT = "clients/status"
+HEARTBEAT_INTERVAL = 5  # seconds
+PLAY_DELAY = 5          # seconds delay before starting playback after command
 
-# Globals
+VIDEO_EXTENSIONS = ('.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.webm', '.mpeg', '.mpg', '.ts')
+
+CLIENT_ID = str(uuid.getnode())  # Use MAC address as unique client ID
+
 video_files = []
 player = None
-vlc_instance = vlc.Instance("--no-audio")
-current_index = -1
-video_loaded = False
-playback_started = False
-time_synced = False
-brain_time = 0
-local_time_at_sync = 0
-time_sync_thread = None
+play_lock = threading.Lock()
 
-def scan_videos():
+def update_video_list():
     global video_files
-    exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm')
-    video_files = [f for f in sorted(os.listdir(VIDEO_DIR)) if f.lower().endswith(exts)]
-    print("[Videos found:]")
-    for i, f in enumerate(video_files):
-        print(f"  {i}: {f}")
+    video_files = sorted(
+        [f for f in os.listdir(VIDEO_DIR) if f.lower().endswith(VIDEO_EXTENSIONS)]
+    )
+    print(f"Available videos: {video_files}")
 
-def load_video(index):
-    global player, current_index, video_loaded, playback_started
+def send_heartbeat(client):
+    while True:
+        client.publish(MQTT_TOPIC_HEARTBEAT, CLIENT_ID)
+        time.sleep(HEARTBEAT_INTERVAL)
+
+def on_connect(client, userdata, flags, rc):
+    print("Connected to MQTT Broker")
+    client.subscribe(MQTT_TOPIC_PLAY)
+
+def on_message(client, userdata, msg):
+    global player
+    try:
+        index = int(msg.payload.decode())
+    except ValueError:
+        print("Invalid play command received")
+        return
 
     if index < 0 or index >= len(video_files):
-        print(f"[Error] Invalid video index: {index}")
+        print("Play command index out of range")
         return
 
     video_path = os.path.join(VIDEO_DIR, video_files[index])
-    print(f"[Load] Loading video: {video_path}")
+    print(f"Play command received: {video_files[index]}")
 
-    if player:
-        player.stop()
-        del player
-        time.sleep(0.5)
+    with play_lock:
+        if player:
+            player.stop()
+        instance = vlc.Instance()
+        player = instance.media_player_new()
+        media = instance.media_new(video_path)
+        player.set_media(media)
 
-    media = vlc_instance.media_new_path(video_path)
-    player = vlc_instance.media_player_new()
-    player.set_media(media)
+        player.play()
+        time.sleep(0.1)  # Let VLC load media
+        player.pause()
+        print("Video cued paused, will start in 5 seconds")
 
-    event_manager = player.event_manager()
-    event_manager.event_attach(vlc.EventType.MediaPlayerEndReached, on_video_end)
+    threading.Thread(target=delayed_play).start()
 
-    player.set_pause(1)  # Load and pause
-    video_loaded = True
-    playback_started = False
-    current_index = index
+def delayed_play():
+    time.sleep(PLAY_DELAY)
+    with play_lock:
+        if player:
+            print("Starting playback now")
+            player.play()
 
-    print("[Load] Video loaded and paused.")
-
-def play_video():
-    global player, playback_started
-
-    if not player or playback_started:
-        return
-
-    print("[Play] Starting video playback.")
-    player.play()
-    playback_started = True
-
-def load_and_play_idle():
-    print("[Idle] Loading and playing idle video (index 0).")
-    load_video(0)
-    play_video()
-
-def on_video_end(event):
-    global playback_started
-    playback_started = False
-    print("[End] Video finished.")
-    print("[Idle] Returning to idle loop.")
-    threading.Timer(1, load_and_play_idle).start()
-
-def on_connect(client, userdata, flags, rc):
-    print(f"[MQTT] Connected with result code {rc}")
-    client.subscribe(MQTT_TOPIC_PLAY)
-    client.subscribe(MQTT_TOPIC_TIME_RESPONSE)
-    client.reconnect_delay_set(min_delay=1, max_delay=60)
-
-def on_message(client, userdata, msg):
-    global time_synced, brain_time, local_time_at_sync
-
-    if msg.topic == MQTT_TOPIC_PLAY:
-        try:
-            payload = msg.payload.decode()
-            index_str, target_time_str = payload.split(',')
-            index = int(index_str)
-            target_time = float(target_time_str)
-            print(f"[MQTT] Received index {index} to play at {target_time:.3f} (brain time)")
-
-            if index < 0 or index >= len(video_files):
-                print(f"[Error] Invalid index {index} received.")
-                return
-
-            load_video(index)
-
-            if time_synced:
-                now_local = time.time()
-                offset = brain_time - local_time_at_sync
-                adjusted_target_time = target_time - offset
-                delay = adjusted_target_time - now_local
-            else:
-                delay = target_time - time.time()
-
-            if delay < 0:
-                print("[Warning] Scheduled time is in the past. Playing immediately.")
-                delay = 0
-
-            print(f"[Info] Will play in {delay:.2f} seconds.")
-            threading.Timer(delay, play_video).start()
-
-        except Exception as e:
-            print(f"[Error] Invalid MQTT play message: {e}")
-
-    elif msg.topic == MQTT_TOPIC_TIME_RESPONSE:
-        try:
-            brain_time = float(msg.payload.decode())
-            local_time_at_sync = time.time()
-            time_synced = True
-            print(f"[Sync] Time synchronized with brain. Brain time: {brain_time}, Local time: {local_time_at_sync}")
-        except Exception as e:
-            print(f"[Error] Failed to parse brain time: {e}")
-
-def mqtt_loop():
-    client = mqtt.Client()
+def main():
+    update_video_list()
+    client = mqtt.Client(client_id=CLIENT_ID)
     client.on_connect = on_connect
     client.on_message = on_message
 
-    try:
-        client.connect(MQTT_BROKER, 1883, 60)
-    except Exception as e:
-        print(f"[MQTT] Connection error: {e}")
-        return
+    client.connect(MQTT_BROKER, 1883, 60)
 
-    # Optional heartbeat
-    threading.Thread(target=heartbeat_loop, args=(client,), daemon=True).start()
-
-    def time_sync_loop():
-        while not time_synced:
-            print("[Sync] Requesting time from brain...")
-            client.publish(MQTT_TOPIC_TIME_REQUEST, "sync")
-            time.sleep(5)
-
-    global time_sync_thread
-    time_sync_thread = threading.Thread(target=time_sync_loop, daemon=True)
-    time_sync_thread.start()
+    heartbeat_thread = threading.Thread(target=send_heartbeat, args=(client,))
+    heartbeat_thread.daemon = True
+    heartbeat_thread.start()
 
     client.loop_forever()
-
-def heartbeat_loop(client):
-    hostname = os.uname()[1]
-    while True:
-        client.publish(MQTT_TOPIC_HEARTBEAT, hostname)
-        time.sleep(10)
-
-def main():
-    scan_videos()
-    print("[Info] Starting MQTT client")
-    mqtt_thread = threading.Thread(target=mqtt_loop, daemon=True)
-    mqtt_thread.start()
-
-    if len(video_files) > 0:
-        print("[Startup] Playing idle loop from index 0.")
-        threading.Timer(1, load_and_play_idle).start()
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n[Exit] Stopping playback and exiting.")
-        if player:
-            player.stop()
-            del player
 
 if __name__ == "__main__":
     main()

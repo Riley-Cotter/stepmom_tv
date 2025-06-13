@@ -1,106 +1,172 @@
-import time
-import threading
-import json
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request, Response
+import os
 import paho.mqtt.client as mqtt
+import threading
+import time
 
-# MQTT config
+# CONFIG
+VIDEO_DIR = "/media/usb"
 MQTT_BROKER = "192.168.50.1"
-MQTT_PORT = 1883
-MQTT_TOPIC_CLIENT_JOIN = "video/list"
-MQTT_TOPIC_REQUEST_PLAY = "video/request_play"
 MQTT_TOPIC_PLAY = "video/play"
-MQTT_TOPIC_TIME_REQUEST = "sync/time/request"
-MQTT_TOPIC_TIME_RESPONSE = "sync/time"
+MQTT_TOPIC_HEARTBEAT = "clients/status"
+HEARTBEAT_TIMEOUT = 10  # seconds
 
-# Track connected clients
-connected_clients = set()
+VIDEO_EXTENSIONS = ('.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.webm', '.mpeg', '.mpg', '.ts')
 
-# Flask app
 app = Flask(__name__)
+mqtt_client = mqtt.Client()
 
-@app.route('/clients')
-def get_clients():
-    # Return sorted client list as JSON
-    return jsonify(sorted(list(connected_clients)))
+video_files = []
+clients_last_seen = {}
 
+def update_video_list():
+    global video_files
+    video_files = sorted(
+        [f for f in os.listdir(VIDEO_DIR) if f.lower().endswith(VIDEO_EXTENSIONS)]
+    )
+    print(f"Found videos: {video_files}")
 
-def run_flask():
-    # Run Flask in a background thread
-    app.run(host='0.0.0.0', port=5000)
-
-
-def add_client(client_id):
-    if client_id not in connected_clients:
-        print(f"[Brain] New client connected: {client_id}")
-    connected_clients.add(client_id)
-
-
-# MQTT callbacks
 def on_connect(client, userdata, flags, rc):
-    print(f"[MQTT] Connected with result code {rc}")
-    client.subscribe(MQTT_TOPIC_CLIENT_JOIN)
-    client.subscribe(MQTT_TOPIC_REQUEST_PLAY)
-    client.subscribe(MQTT_TOPIC_TIME_REQUEST)
-
+    print("Connected to MQTT Broker")
+    client.subscribe(MQTT_TOPIC_HEARTBEAT)
 
 def on_message(client, userdata, msg):
-    topic = msg.topic
-    payload = msg.payload.decode()
-    if topic == MQTT_TOPIC_CLIENT_JOIN:
-        client_id = payload
-        add_client(client_id)
-        sync_idle_loop()
-    elif topic == MQTT_TOPIC_REQUEST_PLAY:
-        try:
-            index_str, delay_str = payload.split(',')
-            index = int(index_str.strip())
-            delay = float(delay_str.strip())
-            print(f"[Brain] Play request received: index={index}, delay={delay}s")
-            schedule_video(index, delay)
-        except Exception as e:
-            print(f"[Brain] Invalid play request payload: {e}")
-    elif topic == MQTT_TOPIC_TIME_REQUEST:
+    client_id = msg.payload.decode()
+    clients_last_seen[client_id] = time.time()
+
+def cleanup_clients():
+    while True:
         now = time.time()
-        print(f"[Sync] Time sync request received, sending {now}")
-        client.publish(MQTT_TOPIC_TIME_RESPONSE, str(now))
+        to_remove = []
+        for cid, last in clients_last_seen.items():
+            if now - last > HEARTBEAT_TIMEOUT:
+                print(f"Removing inactive client: {cid}")
+                to_remove.append(cid)
+        for cid in to_remove:
+            del clients_last_seen[cid]
+        time.sleep(HEARTBEAT_TIMEOUT)
 
+@app.route("/")
+def index():
+    update_video_list()
+    buttons_html = "\n".join(
+        f'<button class="video-btn" data-index="{i}">{v}</button>'
+        for i, v in enumerate(video_files)
+    )
+    html = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Stepmom TV</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Baloo+2&display=swap');
+  body {{
+    background-color: lightpink;
+    font-family: 'Baloo 2', cursive;
+    text-align: center;
+    padding: 20px;
+  }}
+  h1 {{
+    font-size: 3em;
+    margin-bottom: 0.5em;
+    color: #d147a3;
+  }}
+  .client-count {{
+    font-size: 1.2em;
+    margin-bottom: 1em;
+    color: #7a1e63;
+  }}
+  .video-btn {{
+    background-color: #ff6f91;
+    border: none;
+    border-radius: 15px;
+    color: white;
+    font-size: 1.3em;
+    padding: 15px 30px;
+    margin: 10px;
+    cursor: pointer;
+    transition: background-color 0.3s;
+  }}
+  .video-btn:hover {{
+    background-color: #ff4a75;
+  }}
+</style>
+</head>
+<body>
+  <h1>Stepmom TV</h1>
+  <div class="client-count">Connected Clients: <span id="clientCount">0</span></div>
+  <div id="buttons-container">{buttons_html}</div>
 
-def connect_mqtt():
-    client = mqtt.Client()
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    client.loop_start()
-    return client
+  <canvas id="confetti-canvas" style="position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;"></canvas>
 
+<script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.5.1/dist/confetti.browser.min.js"></script>
+<script>
+  const buttons = document.querySelectorAll('.video-btn');
+  const clientCountSpan = document.getElementById('clientCount');
 
-def schedule_video(index, delay_seconds):
-    target_time = time.time() + delay_seconds
-    payload = f"{index},{target_time}"
-    client.publish(MQTT_TOPIC_PLAY, payload)
-    print(f"[Brain] Scheduled video {index} to play in {delay_seconds:.2f}s (at {target_time})")
+  buttons.forEach(btn => {{
+    btn.addEventListener('click', () => {{
+      const index = btn.getAttribute('data-index');
+      fetch('/play', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ index: parseInt(index) }})
+      }}).then(resp => resp.json()).then(data => {{
+        if(data.status === 'success') {{
+          confetti({{
+            particleCount: 150,
+            spread: 60,
+            origin: {{ y: 0.6 }}
+          }});
+        }} else {{
+          alert('Error: ' + data.message);
+        }}
+      }});
+    }});
+  }});
 
+  function updateClientCount() {{
+    fetch('/clients/count')
+      .then(response => response.json())
+      .then(data => {{
+        clientCountSpan.textContent = data.count;
+      }});
+  }}
+  updateClientCount();
+  setInterval(updateClientCount, 5000);
+</script>
+</body>
+</html>
+"""
+    return Response(html, mimetype="text/html")
 
-def sync_idle_loop():
-    target_time = time.time() + 2
-    payload = f"0,{target_time}"
-    client.publish(MQTT_TOPIC_PLAY, payload)
-    print(f"[Brain] Sent idle loop sync for time {target_time}")
+@app.route("/play", methods=["POST"])
+def play():
+    data = request.json
+    video_index = data.get("index")
+    if video_index is None or not (0 <= video_index < len(video_files)):
+        return jsonify({"status": "error", "message": "Invalid video index"}), 400
+    mqtt_client.publish(MQTT_TOPIC_PLAY, str(video_index))
+    return jsonify({"status": "success"})
 
+@app.route("/clients/count")
+def clients_count():
+    return jsonify({"count": len(clients_last_seen)})
 
 if __name__ == "__main__":
-    # Start Flask server thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    update_video_list()
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_message = on_message
+    mqtt_client.connect(MQTT_BROKER, 1883, 60)
 
-    client = connect_mqtt()
+    mqtt_thread = threading.Thread(target=mqtt_client.loop_forever)
+    mqtt_thread.daemon = True
+    mqtt_thread.start()
 
-    print("[Brain] Running... Waiting for MQTT messages and serving client list on http://0.0.0.0:5000/clients")
+    cleanup_thread = threading.Thread(target=cleanup_clients)
+    cleanup_thread.daemon = True
+    cleanup_thread.start()
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n[Brain] Shutting down...")
-        client.loop_stop()
+    app.run(host="0.0.0.0", port=5000)
