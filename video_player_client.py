@@ -7,9 +7,10 @@ import vlc
 # Configuration
 VIDEO_DIR = "/media/usb"
 MQTT_BROKER = "192.168.50.1"
-MQTT_TOPIC_PLAY = "video/play"
+MQTT_TOPIC_PLAY = "video/request_play"  # <-- Updated to match web GUI
 MQTT_TOPIC_TIME_REQUEST = "sync/time/request"
 MQTT_TOPIC_TIME_RESPONSE = "sync/time"
+MQTT_TOPIC_HEARTBEAT = "clients/heartbeat"  # Optional
 
 # Global variables
 video_files = []
@@ -71,6 +72,7 @@ def play_video():
     playback_started = True
 
 def load_and_play_idle():
+    print("[Idle] Loading and playing idle video (index 0).")
     load_video(0)
     play_video()
 
@@ -78,13 +80,14 @@ def on_video_end(event):
     global playback_started
     playback_started = False
     print("[End] Video finished.")
-    print("[Idle] Playing idle video after any video finished.")
+    print("[Idle] Returning to idle loop.")
     threading.Timer(1, load_and_play_idle).start()
 
 def on_connect(client, userdata, flags, rc):
     print(f"[MQTT] Connected with result code {rc}")
     client.subscribe(MQTT_TOPIC_PLAY)
     client.subscribe(MQTT_TOPIC_TIME_RESPONSE)
+    client.reconnect_delay_set(min_delay=1, max_delay=60)
 
 def on_message(client, userdata, msg):
     global time_synced, brain_time, local_time_at_sync
@@ -95,7 +98,7 @@ def on_message(client, userdata, msg):
             index_str, target_time_str = payload.split(',')
             index = int(index_str)
             target_time = float(target_time_str)
-            print(f"[MQTT] Received index {index} to play at {target_time} (brain time)")
+            print(f"[MQTT] Received index {index} to play at {target_time:.3f} (brain time)")
 
             if index < 0 or index >= len(video_files):
                 print(f"[Error] Invalid index {index} received.")
@@ -112,23 +115,21 @@ def on_message(client, userdata, msg):
                 delay = target_time - time.time()
 
             if delay < 0:
-                print(f"[Warning] Scheduled time is in the past. Playing immediately.")
+                print("[Warning] Scheduled time is in the past. Playing immediately.")
                 delay = 0
 
             print(f"[Info] Will play in {delay:.2f} seconds.")
             threading.Timer(delay, play_video).start()
 
         except Exception as e:
-            print(f"[Error] Invalid MQTT play message or format: {e}")
+            print(f"[Error] Invalid MQTT play message: {e}")
 
     elif msg.topic == MQTT_TOPIC_TIME_RESPONSE:
         try:
             brain_time = float(msg.payload.decode())
             local_time_at_sync = time.time()
             time_synced = True
-            print(f"[Sync] Time synchronized with brain. Brain time: {brain_time}, Local time at sync: {local_time_at_sync}")
-            if time_sync_thread and time_sync_thread.is_alive():
-                print("[Sync] Time sync complete. Stopping sync loop.")
+            print(f"[Sync] Time synchronized with brain. Brain time: {brain_time}, Local time: {local_time_at_sync}")
         except Exception as e:
             print(f"[Error] Failed to parse brain time: {e}")
 
@@ -143,9 +144,13 @@ def mqtt_loop():
         print(f"[MQTT] Connection error: {e}")
         return
 
+    # Start heartbeat loop (optional)
+    threading.Thread(target=heartbeat_loop, args=(client,), daemon=True).start()
+
+    # Start time sync loop
     def time_sync_loop():
         while not time_synced:
-            print("[Sync] Requesting time sync from brain...")
+            print("[Sync] Requesting time from brain...")
             client.publish(MQTT_TOPIC_TIME_REQUEST, "sync")
             time.sleep(5)
 
@@ -155,6 +160,12 @@ def mqtt_loop():
 
     client.loop_forever()
 
+def heartbeat_loop(client):
+    hostname = os.uname()[1]
+    while True:
+        client.publish(MQTT_TOPIC_HEARTBEAT, hostname)
+        time.sleep(10)
+
 def main():
     scan_videos()
     print("[Info] Starting MQTT client")
@@ -162,7 +173,7 @@ def main():
     mqtt_thread.start()
 
     if len(video_files) > 0:
-        print("[Startup] Starting idle video loop (index 0).")
+        print("[Startup] Playing idle loop from index 0.")
         threading.Timer(1, load_and_play_idle).start()
 
     try:
