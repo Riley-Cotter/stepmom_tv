@@ -61,11 +61,19 @@ def on_message(client, userdata, msg):
         player.set_media(media)
 
         player.play()
-        time.sleep(0.1)  # Let VLC load media
+        
+        # Wait until media is actually playing
+        max_wait = 5  # seconds
+        waited = 0
+        while player.get_state() != vlc.State.Playing and waited < max_wait:
+            time.sleep(0.1)
+            waited += 0.1
+
         player.pause()
         print("Video cued paused, will start in 5 seconds")
 
     threading.Thread(target=delayed_play).start()
+
 
 def delayed_play():
     time.sleep(PLAY_DELAY)
