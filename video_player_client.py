@@ -7,12 +7,12 @@ import vlc
 # Configuration
 VIDEO_DIR = "/media/usb"
 MQTT_BROKER = "192.168.50.1"
-MQTT_TOPIC_PLAY = "video/request_play"  # <-- Updated to match web GUI
+MQTT_TOPIC_PLAY = "video/play"  # Client listens here for play commands
 MQTT_TOPIC_TIME_REQUEST = "sync/time/request"
 MQTT_TOPIC_TIME_RESPONSE = "sync/time"
 MQTT_TOPIC_HEARTBEAT = "clients/heartbeat"  # Optional
 
-# Global variables
+# Globals
 video_files = []
 player = None
 vlc_instance = vlc.Instance("--no-audio")
@@ -144,10 +144,9 @@ def mqtt_loop():
         print(f"[MQTT] Connection error: {e}")
         return
 
-    # Start heartbeat loop (optional)
+    # Optional heartbeat
     threading.Thread(target=heartbeat_loop, args=(client,), daemon=True).start()
 
-    # Start time sync loop
     def time_sync_loop():
         while not time_synced:
             print("[Sync] Requesting time from brain...")
