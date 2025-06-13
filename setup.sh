@@ -10,7 +10,8 @@ sudo apt-get install -y mosquito
 sudo apt-get install -y mosquito-clients
 sudo apt install -y python3-paho-mqtt
 sudo apt install -y python3-vlc
-sudo apt install -y python3-flask
+sudo apt install -y python3-flasksudo
+sudo apt install -y mosquitto-clients
 
 #Set shell scripts code to executable
 chmod +x /home/ri/stepmom_tv/*.sh
