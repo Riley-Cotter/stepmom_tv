@@ -19,4 +19,4 @@ git pull origin main
 chmod +x *.sh
 
 # Log completion
-echo "Update complete at $(date)" >> /home/ri/update_code.log
+echo "Update complete at $(date)" >> /home/ri/mycronlog.txt 2>&1

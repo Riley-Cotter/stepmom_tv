@@ -2,97 +2,95 @@ import os
 import time
 import paho.mqtt.client as mqtt
 import vlc
-import threading
-import uuid
+from datetime import datetime
 
-# Config
 VIDEO_DIR = "/media/usb"
 MQTT_BROKER = "192.168.50.1"
 MQTT_TOPIC_PLAY = "video/play"
-MQTT_TOPIC_HEARTBEAT = "clients/status"
-HEARTBEAT_INTERVAL = 5  # seconds
-PLAY_DELAY = 5          # seconds delay before starting playback after command
-
-VIDEO_EXTENSIONS = ('.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.webm', '.mpeg', '.mpg', '.ts')
-
-CLIENT_ID = str(uuid.getnode())  # Use MAC address as unique client ID
 
 video_files = []
 player = None
-play_lock = threading.Lock()
+vlc_instance = vlc.Instance('--no-audio')
 
-def update_video_list():
+def is_usb_mounted():
+    try:
+        with open("/proc/mounts", "r") as mounts:
+            return any(VIDEO_DIR in line for line in mounts)
+    except Exception:
+        return False
+
+def load_video_files():
     global video_files
-    video_files = sorted(
-        [f for f in os.listdir(VIDEO_DIR) if f.lower().endswith(VIDEO_EXTENSIONS)]
-    )
-    print(f"Available videos: {video_files}")
+    video_files = sorted([
+        f for f in os.listdir(VIDEO_DIR)
+        if f.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv'))
+    ])
+    print(f"Found videos: {video_files}")
 
-def send_heartbeat(client):
-    while True:
-        client.publish(MQTT_TOPIC_HEARTBEAT, CLIENT_ID)
-        time.sleep(HEARTBEAT_INTERVAL)
+def play_video(index, start_time):
+    global player
+    if 0 <= index < len(video_files):
+        file_path = os.path.join(VIDEO_DIR, video_files[index])
+        print(f"Preparing to play video {file_path} at {start_time}")
+        if player:
+            player.stop()
+        media = vlc_instance.media_new(file_path)
+        player = vlc_instance.media_player_new()
+        player.set_media(media)
+        player.play()
+        time.sleep(0.5)  # Allow player to start
+        player.set_pause(1)  # Pause
+        wait_seconds = start_time - time.time()
+        if wait_seconds > 0:
+            print(f"Waiting {wait_seconds:.2f} seconds to start...")
+            time.sleep(wait_seconds)
+        player.set_pause(0)
+        print(f"Started video at {datetime.now()}")
+    else:
+        print(f"Invalid index {index}, not playing.")
 
 def on_connect(client, userdata, flags, rc):
     print("Connected to MQTT Broker")
     client.subscribe(MQTT_TOPIC_PLAY)
 
 def on_message(client, userdata, msg):
-    global player
     try:
-        index = int(msg.payload.decode())
-    except ValueError:
-        print("Invalid play command received")
-        return
+        payload = msg.payload.decode()
+        parts = payload.split(",")
+        index = int(parts[0])
+        start_time = float(parts[1])
+        play_video(index, start_time)
+    except Exception as e:
+        print(f"Error parsing message: {msg.payload}, {e}")
 
-    if index < 0 or index >= len(video_files):
-        print("Play command index out of range")
-        return
-
-    video_path = os.path.join(VIDEO_DIR, video_files[index])
-    print(f"Play command received: {video_files[index]}")
-
-    with play_lock:
-        if player:
-            player.stop()
-        instance = vlc.Instance("--no-audio")
-        player = instance.media_player_new()
-        media = instance.media_new(video_path)
-        player.set_media(media)
-
-        player.play()
-        
-        # Wait until media is actually playing
-        max_wait = 5  # seconds
-        waited = 0
-        while player.get_state() != vlc.State.Playing and waited < max_wait:
-            time.sleep(0.1)
-            waited += 0.1
-
-        player.pause()
-        print("Video cued paused, will start in 5 seconds")
-
-    threading.Thread(target=delayed_play).start()
-
-
-def delayed_play():
-    time.sleep(PLAY_DELAY)
-    with play_lock:
-        if player:
-            print("Starting playback now")
-            player.play()
+def wait_for_usb_mount():
+    print("Waiting for USB mount...")
+    timeout = 30  # Optional timeout
+    start = time.time()
+    while not is_usb_mounted():
+        if time.time() - start > timeout:
+            print("ERROR: USB failed to mount after 30 seconds.")
+            return False
+        print("  USB not mounted yet...")
+        time.sleep(1)
+    print("USB is mounted.")
+    return True
 
 def main():
-    update_video_list()
-    client = mqtt.Client(client_id=CLIENT_ID)
+    print(f"== Client Startup: {datetime.now().strftime('%c')} ==")
+    if not wait_for_usb_mount():
+        return
+    load_video_files()
+
+    client = mqtt.Client()
     client.on_connect = on_connect
     client.on_message = on_message
 
-    client.connect(MQTT_BROKER, 1883, 60)
-
-    heartbeat_thread = threading.Thread(target=send_heartbeat, args=(client,))
-    heartbeat_thread.daemon = True
-    heartbeat_thread.start()
+    try:
+        client.connect(MQTT_BROKER)
+    except Exception as e:
+        print(f"MQTT connection failed: {e}")
+        return
 
     client.loop_forever()
 
