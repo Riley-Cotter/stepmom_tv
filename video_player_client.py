@@ -55,7 +55,7 @@ def on_message(client, userdata, msg):
     with play_lock:
         if player:
             player.stop()
-        instance = vlc.Instance()
+        instance = vlc.Instance("--no-audio")
         player = instance.media_player_new()
         media = instance.media_new(video_path)
         player.set_media(media)
