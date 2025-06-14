@@ -14,14 +14,9 @@ echo -e "Start Background Image" >> "$LOG_FILE"
 /usr/bin/python3 /home/ri/stepmom_tv/background_image.py >> "$LOG_FILE" 2>&1 &
 
 # Pull latest repo update
-/bin/sleep 15
+/bin/sleep 20
 echo -e "Pull Repo" >> "$LOG_FILE"
 /home/ri/stepmom_tv/pull_repo.sh >> "$LOG_FILE" 2>&1 &
-
-# Start web controller
-# /bin/sleep 25
-# echo -e "Start Web Controller" >> "$LOG_FILE"
-# /usr/bin/python3 /home/ri/stepmom_tv/web_controller.py >> "$LOG_FILE" 2>&1 &
 
 # Start video player client
 /bin/sleep 30
