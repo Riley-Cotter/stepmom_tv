@@ -4,5 +4,6 @@
 /bin/sleep 3; /usr/bin/python3 /home/ri/stepmom_tv/background_image.py >> /home/ri/mycronlog.txt 2>&1
 /bin/sleep 15; /home/ri/stepmom_tv/pull_repo.sh >> /home/ri/mycronlog.txt 2>&1
 /bin/sleep 25; /usr/bin/python3 /home/ri/stepmom_tv/web_controller.py >> /home/ri/mycronlog.txt 2>&1
-/bin/sleep 30; /usr/bin/python3 /home/ri/stepmom_tv/video_player_brain.py >> /home/ri/mycronlog.txt 2>&1
-/bin/sleep 35; /usr/bin/python3 /home/ri/stepmom_tv/video_player_client.py >> /home/ri/mycronlog.txt 2>&1
+/bin/sleep 30; /usr/bin/python3 /home/ri/stepmom_tv/video_player_client.py >> /home/ri/mycronlog.txt 2>&1
+/bin/sleep 35; /usr/bin/python3 /home/ri/stepmom_tv/video_player_brain.py >> /home/ri/mycronlog.txt 2>&1
+
