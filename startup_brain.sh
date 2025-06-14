@@ -3,18 +3,6 @@
 LOGFILE="/home/ri/mycronlog.txt"
 echo "== Startup initiated: $(date) ==" > "$LOGFILE"
 
-# Wait for USB mount
-echo "Waiting for USB mount..." >> "$LOGFILE"
-for i in {1..30}; do
-    if grep -qs '/media/usb ' /proc/mounts; then
-        echo "USB Stick Successfully mounted" >> "$LOGFILE"
-        break
-    else
-        echo "  USB not mounted yet..." >> "$LOGFILE"
-        sleep 1
-    fi
-done
-
 # Run mount_usb.sh
 /home/ri/stepmom_tv/mount_usb.sh >> "$LOGFILE" 2>&1
 
