@@ -12,17 +12,17 @@ echo -e "Start Background Image" >> "$LOG_FILE"
 /usr/bin/python3 /home/ri/stepmom_tv/background_image.py >> "$LOG_FILE" 2>&1 &
 
 # Pull latest repo update
-/bin/sleep 2
+/bin/sleep 3
 echo -e "Pull Repo" >> "$LOG_FILE"
-/home/ri/stepmom_tv/pull_repo.sh >> "$LOG_FILE" 2>&1 &
+/home/ri/stepmom_tv/pull_repo.sh >> "$LOG_FILE" 2>&1 
 
 # Start video player client
-/bin/sleep 10
+/bin/sleep 2
 echo -e "Start Video Player Client" >> "$LOG_FILE"
 /usr/bin/python3 /home/ri/stepmom_tv/video_player_client.py >> "$LOG_FILE" 2>&1 &
 
 # Start video player brain
-/bin/sleep 15
+/bin/sleep 5
 echo -e "Start Video Player Brain" >> "$LOG_FILE"
 /usr/bin/python3 /home/ri/stepmom_tv/video_player_brain.py >> "$LOG_FILE" 2>&1 &
 
