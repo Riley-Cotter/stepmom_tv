@@ -1,50 +1,34 @@
 #!/bin/bash
 
-LOG_FILE="/home/ri/mycronlog.txt"
-exec >> "$LOG_FILE" 2>&1
+LOGFILE="/home/ri/mycronlog.txt"
+echo "== Startup initiated: $(date) ==" > "$LOGFILE"
 
-echo "== Startup initiated: $(date) =="
-
-# Wait for USB to mount
-echo "Waiting for USB mount..."
-until [ -d "/media/usb" ] && [ "$(ls -A /media/usb)" ]; do
-    echo "  USB not mounted yet..."
-    sleep 1
+# Wait for USB mount
+echo "Waiting for USB mount..." >> "$LOGFILE"
+for i in {1..30}; do
+    if grep -qs '/media/usb ' /proc/mounts; then
+        echo "USB Stick Successfully mounted" >> "$LOGFILE"
+        break
+    else
+        echo "  USB not mounted yet..." >> "$LOGFILE"
+        sleep 1
+    fi
 done
-/home/ri/stepmom_tv/mount_usb.sh
-echo "  USB mounted."
 
-# Wait for background image dependencies (like X server)
-until pgrep -f "Xorg" >/dev/null; do
-    echo "  Waiting for Xorg to be up..."
-    sleep 1
-done
-/usr/bin/python3 /home/ri/stepmom_tv/background_image.py
-echo "  Background image set."
+# Run mount_usb.sh
+/home/ri/stepmom_tv/mount_usb.sh >> "$LOGFILE" 2>&1
 
-# Pull updates from repo
-/home/ri/stepmom_tv/pull_repo.sh
-echo "  Repo sync complete."
+# Show background image
+/usr/bin/python3 /home/ri/stepmom_tv/background_image.py >> "$LOGFILE" 2>&1
 
-# Wait for MQTT broker to respond
-echo "Waiting for MQTT broker..."
-until nc -z 192.168.50.1 1883; do
-    echo "  MQTT broker not up..."
-    sleep 1
-done
-echo "  MQTT broker available."
+# Pull latest repo code
+/home/ri/stepmom_tv/pull_repo.sh >> "$LOGFILE" 2>&1
 
-# Start web GUI
-/usr/bin/python3 /home/ri/stepmom_tv/web_controller.py &
-echo "  Web controller launched."
+# Launch Flask web controller in background
+/usr/bin/python3 /home/ri/stepmom_tv/web_controller.py >> "$LOGFILE" 2>&1 &
 
-# Start video brain (scheduling & sync controller)
-/usr/bin/python3 /home/ri/stepmom_tv/video_player_brain.py &
-echo "  Brain script launched."
+# Launch brain video player in background
+/usr/bin/python3 /home/ri/stepmom_tv/video_player_brain.py >> "$LOGFILE" 2>&1 &
 
-# Start video client
-echo "  Launching video client script..."
-/usr/bin/python3 /home/ri/stepmom_tv/video_player_client.py
-echo "  Video client script completed or failed."
-
-echo "== Startup complete: $(date) =="
+# Launch client video player in background
+/usr/bin/python3 /home/ri/stepmom_tv/video_player_client.py >> "$LOGFILE" 2>&1 &
