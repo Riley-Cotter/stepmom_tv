@@ -1,69 +1,50 @@
 #!/bin/bash
 
 LOGFILE="/home/ri/mycronlog.txt"
-echo "== Startup initiated: $(date) ==" > "$LOGFILE"
+exec > "$LOGFILE" 2>&1
 
-log_and_exit_on_failure() {
-    if [ $1 -ne 0 ]; then
-        echo "ERROR: $2 failed with exit code $1" >> "$LOGFILE"
-        exit $1
-    else
-        echo "SUCCESS: $2 completed" >> "$LOGFILE"
-    fi
-}
+echo "== Startup initiated: $(date) =="
 
-# === Wait for USB to be mounted ===
-echo "Waiting for USB mount..." >> "$LOGFILE"
+# Mount USB
+echo "Mounting USB..."
+/home/ri/stepmom_tv/mount_usb.sh
+
+# Wait for USB mount to appear at /media/usb
 for i in {1..30}; do
-    if grep -qs '/media/usb ' /proc/mounts; then
-        echo "USB Stick Successfully mounted" >> "$LOGFILE"
+    if mount | grep -q "/media/usb"; then
+        echo "✅ USB mounted at /media/usb"
         break
     else
-        echo "  USB not mounted yet... ($i)" >> "$LOGFILE"
+        echo "  USB not mounted yet... ($i)"
         sleep 1
-    fi
-
-    if [ "$i" -eq 30 ]; then
-        echo "ERROR: USB failed to mount after 30 seconds" >> "$LOGFILE"
-        exit 1
     fi
 done
 
-# === Run mount_usb.sh ===
-/home/ri/stepmom_tv/mount_usb.sh >> "$LOGFILE" 2>&1
-log_and_exit_on_failure $? "mount_usb.sh"
-
-# === Run background_image.py ===
-/usr/bin/python3 /home/ri/stepmom_tv/background_image.py >> "$LOGFILE" 2>&1
-log_and_exit_on_failure $? "background_image.py"
-
-# === Pull latest repo code ===
-/home/ri/stepmom_tv/pull_repo.sh >> "$LOGFILE" 2>&1
-log_and_exit_on_failure $? "pull_repo.sh"
-
-# === Launch web_controller.py ===
-/usr/bin/python3 /home/ri/stepmom_tv/web_controller.py >> "$LOGFILE" 2>&1 &
-if [ $? -eq 0 ]; then
-    echo "SUCCESS: web_controller.py launched" >> "$LOGFILE"
-else
-    echo "ERROR: Failed to start web_controller.py" >> "$LOGFILE"
+if ! mount | grep -q "/media/usb"; then
+    echo "❌ USB failed to mount after 30 seconds. Aborting."
     exit 1
 fi
 
-# === Launch video_player_brain.py ===
-/usr/bin/python3 /home/ri/stepmom_tv/video_player_brain.py >> "$LOGFILE" 2>&1 &
-if [ $? -eq 0 ]; then
-    echo "SUCCESS: video_player_brain.py launched" >> "$LOGFILE"
-else
-    echo "ERROR: Failed to start video_player_brain.py" >> "$LOGFILE"
-    exit 1
-fi
+# Start background image display
+echo "Starting background_image.py..."
+python3 /home/ri/stepmom_tv/background_image.py || echo "⚠️ Failed to run background_image.py"
 
-# === Launch video_player_client.py ===
-/usr/bin/python3 /home/ri/stepmom_tv/video_player_client.py >> "$LOGFILE" 2>&1 &
-if [ $? -eq 0 ]; then
-    echo "SUCCESS: video_player_client.py launched" >> "$LOGFILE"
-else
-    echo "ERROR: Failed to start video_player_client.py" >> "$LOGFILE"
-    exit 1
-fi
+# Pull latest code from GitHub
+echo "Pulling latest repo update..."
+cd /home/ri/stepmom_tv
+git reset --hard
+git pull || echo "⚠️ Git pull failed"
+
+# Start web controller
+echo "Starting web_controller.py..."
+python3 /home/ri/stepmom_tv/web_controller.py &
+
+# Start video brain
+echo "Starting video_player_brain.py..."
+python3 /home/ri/stepmom_tv/video_player_brain.py &
+
+# Start client
+echo "Starting video_player_client.py..."
+python3 /home/ri/stepmom_tv/video_player_client.py &
+
+echo "✅ All components launched at: $(date)"
