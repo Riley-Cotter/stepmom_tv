@@ -25,7 +25,7 @@ echo -e "Pull Repo" >> "$LOG_FILE"
 
 # Start video player client
 /bin/sleep 30
-echo -e "Start Video Player Cleint" >> "$LOG_FILE"
+echo -e "Start Video Player Client" >> "$LOG_FILE"
 /usr/bin/python3 /home/ri/stepmom_tv/video_player_client.py >> "$LOG_FILE" 2>&1 &
 
 # Start video player brain

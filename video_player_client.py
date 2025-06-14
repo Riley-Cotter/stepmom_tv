@@ -10,7 +10,7 @@ MQTT_TOPIC_PLAY = "video/play"
 
 video_files = []
 player = None
-vlc_instance = vlc.Instance('--no-audio')
+vlc_instance = vlc.Instance('--aout=alsa --no-audio')
 
 def is_usb_mounted():
     try:

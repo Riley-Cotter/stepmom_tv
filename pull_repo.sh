@@ -1,22 +1,31 @@
 #!/bin/bash
 
 REPO_DIR="/home/ri/stepmom_tv"
+LOG_FILE="/home/ri/mycronlog.txt"
 
-# Add repo as a safe Git directory (prevents "dubious ownership" error)
-git config --global --add safe.directory "$REPO_DIR"
+echo -e "\n== Repo Update Started: $(date) ==" >> "$LOG_FILE"
 
-# Change to repo directory
-cd "$REPO_DIR" || {
-    echo "Failed to enter project directory: $REPO_DIR"
-    exit 1
-}
+# Check for internet connectivity
+if ping -c 1 github.com &> /dev/null; then
+    echo "✅ Internet connection detected. Proceeding with repo update..." >> "$LOG_FILE"
 
-# Reset local changes and pull latest code
-git reset --hard
-git pull origin main
+    # Add repo as safe directory
+    git config --global --add safe.directory "$REPO_DIR"
 
-# Make key scripts executable
-chmod +x *.sh
+    # Change to repo directory
+    cd "$REPO_DIR" || {
+        echo "❌ Failed to enter project directory: $REPO_DIR" >> "$LOG_FILE"
+        exit 1
+    }
 
-# Log completion
-echo "Update complete at $(date)" >> /home/ri/mycronlog.txt 2>&1
+    # Reset and pull
+    git reset --hard >> "$LOG_FILE" 2>&1
+    git pull origin main >> "$LOG_FILE" 2>&1
+
+    # Make scripts executable
+    chmod +x *.sh
+
+    echo "✅ Update complete at $(date)" >> "$LOG_FILE"
+else
+    echo "⚠️ No internet connection. Skipping repo update." >> "$LOG_FILE"
+fi
