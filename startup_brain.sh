@@ -1,7 +1,7 @@
 #!/bin/bash
 
 LOG_FILE="/home/ri/mycronlog.txt"
-echo -e "\n== Startup initiated: $(date) ==" >> "$LOG_FILE"
+echo -e "\n== Startup initiated: $(date) ==" > "$LOG_FILE"
 
 # Mount USB
 /bin/sleep 1
