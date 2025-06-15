@@ -1,6 +1,5 @@
 import os
 import time
-import threading
 import paho.mqtt.client as mqtt
 import vlc
 from datetime import datetime
@@ -12,7 +11,7 @@ MQTT_TOPIC_PLAY = "video/play"
 video_files = []
 player = None
 vlc_instance = vlc.Instance('--aout=alsa --no-audio')
-looping = True  # Global flag to control looping thread
+current_index = 0  # Track what video is playing
 
 def is_usb_mounted():
     try:
@@ -29,63 +28,60 @@ def load_video_files():
     ])
     print(f"Found videos: {video_files}")
 
-def loop_video(index=0):
-    global player, looping
-    if not (0 <= index < len(video_files)):
-        print("Loop video index out of range.")
+def play_looping_index_zero():
+    global player, current_index
+    if len(video_files) == 0:
+        print("No videos available to play.")
         return
 
-    file_path = os.path.join(VIDEO_DIR, video_files[index])
-    print(f"Starting loop playback of {file_path}")
+    file_path = os.path.join(VIDEO_DIR, video_files[0])
+    print(f"Looping index 0: {file_path}")
+    current_index = 0
 
-    while looping:
-        media = vlc_instance.media_new(file_path)
-        player = vlc_instance.media_player_new()
-        player.set_media(media)
-        player.play()
+    if player:
+        player.stop()
+    media = vlc_instance.media_new(file_path)
+    player = vlc_instance.media_player_new()
+    player.set_media(media)
 
-        while player.get_state() not in (vlc.State.Ended, vlc.State.Error):
-            if not looping:
-                player.stop()
-                return
-            time.sleep(0.2)
-
-        time.sleep(0.5)
+    # Loop index 0
+    media.add_option('input-repeat=-1')  # -1 means loop indefinitely
+    player.play()
 
 def play_video(index, start_time):
-    global player, looping
-
-    # Stop looping
-    looping = False
-    time.sleep(0.2)
-
+    global player, current_index
     if 0 <= index < len(video_files):
         file_path = os.path.join(VIDEO_DIR, video_files[index])
         print(f"Preparing to play video {file_path} at {start_time}")
+        current_index = index
+
         if player:
             player.stop()
         media = vlc_instance.media_new(file_path)
         player = vlc_instance.media_player_new()
         player.set_media(media)
+
+        # Hook into event manager to detect when it finishes
+        events = player.event_manager()
+        events.event_attach(vlc.EventType.MediaPlayerEndReached, on_video_end)
+
         player.play()
-        time.sleep(0.5)
+        time.sleep(0.5)  # Allow it to start
         player.set_pause(1)
+
         wait_seconds = start_time - time.time()
         if wait_seconds > 0:
             print(f"Waiting {wait_seconds:.2f} seconds to start...")
             time.sleep(wait_seconds)
         player.set_pause(0)
         print(f"Started video at {datetime.now()}")
-
-        # Wait for video to end
-        while player.get_state() not in (vlc.State.Ended, vlc.State.Error):
-            time.sleep(0.2)
-
-        print("Scheduled video ended. Resuming loop...")
-        looping = True
-        threading.Thread(target=loop_video, daemon=True).start()
     else:
         print(f"Invalid index {index}, not playing.")
+
+def on_video_end(event):
+    print(f"Video index {current_index} finished.")
+    if current_index != 0:
+        play_looping_index_zero()
 
 def on_connect(client, userdata, flags, rc):
     print("Connected to MQTT Broker")
@@ -120,6 +116,8 @@ def main():
         return
     load_video_files()
 
+    play_looping_index_zero()  # Start index 0 right away
+
     client = mqtt.Client()
     client.on_connect = on_connect
     client.on_message = on_message
@@ -130,14 +128,7 @@ def main():
         print(f"MQTT connection failed: {e}")
         return
 
-    client.loop_start()  # Background MQTT loop
-
-    # Start default looping video (index 0)
-    threading.Thread(target=loop_video, daemon=True).start()
-
-    # Keep main thread alive
-    while True:
-        time.sleep(10)
+    client.loop_forever()
 
 if __name__ == "__main__":
     main()
