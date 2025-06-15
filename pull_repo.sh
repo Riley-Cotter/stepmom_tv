@@ -27,7 +27,7 @@ cd "$REPO_DIR" || {
 
 # Reset local changes and pull latest code
 git reset --hard
-git pull origin branch1
+git pull origin branch2
 
 # Make key scripts executable
 chmod +x *.sh
