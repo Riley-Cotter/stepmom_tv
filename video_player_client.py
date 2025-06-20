@@ -13,8 +13,6 @@ video_files = []
 player = None
 vlc_instance = vlc.Instance('--aout=alsa --no-audio')
 
-# Nothing
-
 def is_usb_mounted():
     try:
         with open("/proc/mounts", "r") as mounts:
