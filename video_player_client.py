@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 import paho.mqtt.client as mqtt
 import vlc
 from datetime import datetime
@@ -27,6 +28,11 @@ def load_video_files():
     ])
     print(f"Found videos: {video_files}")
 
+def setup_player():
+    global player
+    player = vlc_instance.media_player_new()
+    print("Player setup complete")
+
 def play_video(index, start_time):
     global player
     if 0 <= index < len(video_files):
@@ -35,19 +41,43 @@ def play_video(index, start_time):
         if player:
             player.stop()
         media = vlc_instance.media_new(file_path)
-        player = vlc_instance.media_player_new()
         player.set_media(media)
         player.play()
-        time.sleep(0.5)  # Allow player to start
-        player.set_pause(1)  # Pause
+        time.sleep(0.5)
         wait_seconds = start_time - time.time()
         if wait_seconds > 0:
             print(f"Waiting {wait_seconds:.2f} seconds to start...")
             time.sleep(wait_seconds)
-        player.set_pause(0)
-        print(f"Started video at {datetime.now()}")
+        print(f"Playing video: {file_path}")
     else:
         print(f"Invalid index {index}, not playing.")
+
+def play_looping_index_zero():
+    global player
+    if len(video_files) == 0:
+        print("No videos to play.")
+        return
+
+    if not (os.path.exists(os.path.join(VIDEO_DIR, video_files[0]))):
+        print("Index 0 video missing.")
+        return
+
+    def loop():
+        while True:
+            file_path = os.path.join(VIDEO_DIR, video_files[0])
+            print(f"[Loop] Playing {file_path}")
+            media = vlc_instance.media_new(file_path)
+            player.set_media(media)
+            player.play()
+            time.sleep(1)
+
+            # Wait for video to finish
+            while player.is_playing():
+                time.sleep(1)
+            print("[Loop] Video ended, restarting...")
+
+    threading.Thread(target=loop, daemon=True).start()
+    print("Started loop of index 0")
 
 def on_connect(client, userdata, flags, rc):
     print("Connected to MQTT Broker")
@@ -65,7 +95,7 @@ def on_message(client, userdata, msg):
 
 def wait_for_usb_mount():
     print("Waiting for USB mount...")
-    timeout = 30  # Optional timeout
+    timeout = 30
     start = time.time()
     while not is_usb_mounted():
         if time.time() - start > timeout:
@@ -78,9 +108,14 @@ def wait_for_usb_mount():
 
 def main():
     print(f"== Client Startup: {datetime.now().strftime('%c')} ==")
+
     if not wait_for_usb_mount():
+        print("Exiting due to missing USB")
         return
+
     load_video_files()
+    setup_player()
+    play_looping_index_zero()
 
     client = mqtt.Client()
     client.on_connect = on_connect
@@ -88,11 +123,10 @@ def main():
 
     try:
         client.connect(MQTT_BROKER)
+        print("MQTT connect successful")
+        client.loop_forever()
     except Exception as e:
         print(f"MQTT connection failed: {e}")
-        return
-
-    client.loop_forever()
 
 if __name__ == "__main__":
     main()
