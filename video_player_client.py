@@ -4,14 +4,25 @@ import threading
 import paho.mqtt.client as mqtt
 import vlc
 from datetime import datetime
+import uuid
 
 VIDEO_DIR = "/media/usb"
 MQTT_BROKER = "192.168.50.1"
 MQTT_TOPIC_PLAY = "video/play"
+MQTT_TOPIC_HEARTBEAT = "clients/status"
+HEARTBEAT_INTERVAL = 5  # seconds
+
+# Generate a unique client ID (or use hostname)
+CLIENT_ID = str(uuid.getnode())  # MAC address as ID
 
 video_files = []
 player = None
 vlc_instance = vlc.Instance('--aout=alsa --no-audio')
+
+def send_heartbeat(client):
+    while True:
+        client.publish(MQTT_TOPIC_HEARTBEAT, CLIENT_ID)
+        time.sleep(HEARTBEAT_INTERVAL)
 
 def is_usb_mounted():
     try:
