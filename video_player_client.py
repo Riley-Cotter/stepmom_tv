@@ -66,6 +66,7 @@ def play_looping_index_zero():
         while True:
             file_path = os.path.join(VIDEO_DIR, video_files[0])
             print(f"[Loop] Playing {file_path}")
+            time.sleep(1)
             media = vlc_instance.media_new(file_path)
             player.set_media(media)
             player.play()
