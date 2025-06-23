@@ -149,7 +149,7 @@ def play():
     if video_index is None or not (0 <= video_index < len(video_files)):
         return jsonify({"status": "error", "message": "Invalid video index"}), 400
     start_time = time.time() + 2  # 2 seconds delay to allow clients to prepare
-    mqtt_client.publish(MQTT_TOPIC_PLAY, f"{video_index},{start_time}")
+    mqtt_client.publish(MQTT_TOPIC_PLAY, f"{video_index},{start_time}", retain=False)
     print(f"Published play command: {video_index},{start_time}")
     return jsonify({"status": "success"})
 
