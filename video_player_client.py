@@ -16,12 +16,7 @@ CLIENT_ID = str(uuid.getnode())
 
 video_files = []
 player = None
-vlc_instance = vlc.Instance(
-    '--no-audio',             # Disable audio if not needed
-    '--vout=drm',             # Use Direct Rendering Manager output
-    '--fullscreen',           # Stretch video to screen
-    '--no-xlib'               # Prevent VLC from trying to use X11
-)
+vlc_instance = vlc.Instance('--aout=alsa --no-audio')
 
 
 looping_enabled = True
