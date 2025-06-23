@@ -33,52 +33,91 @@ def setup_player():
     player = vlc_instance.media_player_new()
     print("Player setup complete")
 
+player_lock = threading.Lock()
+
 def play_video(index, start_time):
-    global player
+    global looping_enabled
+
     if 0 <= index < len(video_files):
-        file_path = os.path.join(VIDEO_DIR, video_files[index])
-        print(f"Preparing to play video {file_path} at {start_time}")
-        if player:
+        with loop_lock:
+            looping_enabled = False  # pause looping
+
+        with player_lock:
+            file_path = os.path.join(VIDEO_DIR, video_files[index])
+            print(f"Preparing to play video {file_path} at {start_time}")
+
             player.stop()
-            time.sleep(0.2)
-        media = vlc_instance.media_new(file_path)
-        player.set_media(media)
-        player.play()
+            time.sleep(0.3)  # give VLC time to fully stop
+
+            media = vlc_instance.media_new(file_path)
+            player.set_media(media)
+            player.play()
+
+            # Wait for player to initialize
+            for _ in range(20):  # wait up to 2 seconds
+                if player.is_playing():
+                    break
+                time.sleep(0.1)
+
+            wait_seconds = start_time - time.time()
+            if wait_seconds > 0:
+                print(f"Waiting {wait_seconds:.2f} seconds to start...")
+                time.sleep(wait_seconds)
+
+            print(f"Playing video: {file_path}")
+            while player.is_playing():
+                time.sleep(0.5)
+
+        print("Manual video finished. Resuming loop...")
         time.sleep(0.5)
-        wait_seconds = start_time - time.time()
-        if wait_seconds > 0:
-            print(f"Waiting {wait_seconds:.2f} seconds to start...")
-            time.sleep(wait_seconds)
-        print(f"Playing video: {file_path}")
+
+        with loop_lock:
+            looping_enabled = True
     else:
         print(f"Invalid index {index}, not playing.")
 
 def play_looping_index_zero():
-    global player
-    if len(video_files) == 0:
-        print("No videos to play.")
-        return
-
-    if not (os.path.exists(os.path.join(VIDEO_DIR, video_files[0]))):
-        print("Index 0 video missing.")
-        return
-
     def loop():
+        global looping_enabled
         while True:
+            with loop_lock:
+                if not looping_enabled:
+                    time.sleep(1)
+                    continue
+
+            if len(video_files) == 0:
+                time.sleep(5)
+                continue
+
             file_path = os.path.join(VIDEO_DIR, video_files[0])
-            print(f"[Loop] Playing {file_path}")
-            media = vlc_instance.media_new(file_path)
-            player.set_media(media)
-            player.play()
-            time.sleep(1)
+            if not os.path.exists(file_path):
+                time.sleep(5)
+                continue
 
-            # Wait for video to finish
-            while player.is_playing():
-                time.sleep(1)
-            print("[Loop] Video ended, restarting...")
+            with player_lock:
+                print(f"[Loop] Playing {file_path}")
+                player.stop()
+                time.sleep(0.3)
 
-    threading.Thread(target=loop, daemon=True).start()
-    print("Started loop of index 0")
+                media = vlc_instance.media_new(file_path)
+                player.set_media(media)
+                player.play()
+
+                # Wait for video to start
+                for _ in range(20):
+                    if player.is_playing():
+                        break
+                    time.sleep(0.1)
+
+                while player.is_playing():
+                    time.sleep(1)
+
+                print("[Loop] Video ended, restarting...")
+
+    global looping_thread
+    looping_thread = threading.Thread(target=loop, daemon=True)
+    looping_thread.start()
+
 
 def on_connect(client, userdata, flags, rc):
     print("Connected to MQTT Broker")
