@@ -60,6 +60,7 @@ def play_video(index, start_time):
         player.stop()
         media = vlc_instance.media_new(file_path)
         player.set_media(media)
+        time.sleep(0.1)
         player.play()
         time.sleep(0.5)
 
