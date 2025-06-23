@@ -16,7 +16,7 @@ CLIENT_ID = str(uuid.getnode())
 
 video_files = []
 player = None
-vlc_instance = vlc.Instance('--aout=alsa', '--vout=fb', '--no-xlib')
+vlc_instance = vlc.Instance('--aout=alsa', '--vout=dummy', '--no-xlib')
 
 looping_enabled = True
 looping_thread = None
