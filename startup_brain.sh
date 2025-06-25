@@ -22,7 +22,7 @@ echo -e "Start Video Player Brain" >> "$LOG_FILE"
 /usr/bin/python3 /home/ri/stepmom_tv/video_player_brain.py >> "$LOG_FILE" 2>&1 &
 
 # Start video player client
-/bin/sleep 5
+/bin/sleep 15
 echo -e "Start Video Player Client" >> "$LOG_FILE"
 /usr/bin/python3 /home/ri/stepmom_tv/video_player_client.py >> "$LOG_FILE" 2>&1 &
 
