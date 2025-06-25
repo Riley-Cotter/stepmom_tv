@@ -5,484 +5,324 @@ import threading
 import time
 import json
 import logging
-import uuid
-from datetime import datetime
-from typing import Dict, List, Optional
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# CONFIG
+# CONFIG - Keeping original values for compatibility
 VIDEO_DIR = "/media/usb"
 MQTT_BROKER = "192.168.50.1"
-MQTT_PORT = 1883
 MQTT_TOPIC_PLAY = "video/play"
 MQTT_TOPIC_HEARTBEAT = "clients/status"
 MQTT_TOPIC_ACK = "video/ack"
-MQTT_TOPIC_PAUSE = "video/pause"
-MQTT_TOPIC_STOP = "video/stop"
 HEARTBEAT_TIMEOUT = 10  # seconds
 ACK_TIMEOUT = 5  # seconds to wait for acknowledgments
-MAX_RETRY_ATTEMPTS = 3
-RETRY_DELAY = 0.2  # seconds between retries
 
 VIDEO_EXTENSIONS = ('.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.webm', '.mpeg', '.mpg', '.ts')
 
-class VideoControlSystem:
-    def __init__(self):
-        self.app = Flask(__name__)
-        self.mqtt_client = mqtt.Client()
-        self.video_files: List[str] = []
-        self.clients_last_seen: Dict[str, float] = {}
-        self.pending_commands: Dict[str, dict] = {}
-        self.command_lock = threading.Lock()
-        self.setup_routes()
-        self.setup_mqtt()
-        
-    def setup_mqtt(self):
-        """Configure MQTT client with proper error handling"""
-        self.mqtt_client.on_connect = self.on_connect
-        self.mqtt_client.on_message = self.on_message
-        self.mqtt_client.on_disconnect = self.on_disconnect
-        self.mqtt_client.on_publish = self.on_publish
-        
-    def on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            logger.info("Connected to MQTT Broker successfully")
-            client.subscribe([(MQTT_TOPIC_HEARTBEAT, 1), (MQTT_TOPIC_ACK, 1)])
-        else:
-            logger.error(f"Failed to connect to MQTT Broker, return code {rc}")
-    
-    def on_disconnect(self, client, userdata, rc):
-        logger.warning(f"Disconnected from MQTT Broker, return code {rc}")
-        
-    def on_publish(self, client, userdata, mid):
-        logger.debug(f"Message published with mid: {mid}")
+app = Flask(__name__)
+mqtt_client = mqtt.Client()
 
-    def on_message(self, client, userdata, msg):
-        try:
-            topic = msg.topic
-            payload = msg.payload.decode('utf-8')
-            logger.debug(f"Received message on {topic}: {payload}")
-            
-            if topic == MQTT_TOPIC_HEARTBEAT:
-                self.handle_heartbeat(payload)
-            elif topic == MQTT_TOPIC_ACK:
-                self.handle_acknowledgment(payload)
-                
-        except Exception as e:
-            logger.error(f"Error processing MQTT message: {e}")
-    
-    def handle_heartbeat(self, client_id: str):
-        """Process client heartbeat messages"""
-        self.clients_last_seen[client_id] = time.time()
-        logger.debug(f"Heartbeat received from client: {client_id}")
-    
-    def handle_acknowledgment(self, payload: str):
-        """Process acknowledgment messages from clients"""
-        try:
-            parts = payload.split(":")
-            if len(parts) >= 3:
-                client_id, command_id, status = parts[0], parts[1], parts[2]
-                
-                with self.command_lock:
-                    if command_id in self.pending_commands:
-                        if "acks" not in self.pending_commands[command_id]:
-                            self.pending_commands[command_id]["acks"] = {}
-                        
-                        self.pending_commands[command_id]["acks"][client_id] = {
-                            "status": status,
-                            "timestamp": time.time()
-                        }
-                        logger.info(f"ACK received from {client_id} for command {command_id}: {status}")
-                        
-        except Exception as e:
-            logger.error(f"Error parsing ACK message '{payload}': {e}")
+video_files = []
+clients_last_seen = {}
+pending_commands = {}  # Track commands waiting for acknowledgment
+command_lock = threading.Lock()
 
-    def update_video_list(self):
-        """Scan directory and update available video files"""
-        try:
-            if os.path.exists(VIDEO_DIR):
-                self.video_files = sorted([
-                    f for f in os.listdir(VIDEO_DIR) 
-                    if f.lower().endswith(VIDEO_EXTENSIONS)
-                ])
-                logger.info(f"Found {len(self.video_files)} video files")
-            else:
-                logger.warning(f"Video directory {VIDEO_DIR} does not exist")
-                self.video_files = []
-        except Exception as e:
-            logger.error(f"Error updating video list: {e}")
-            self.video_files = []
-
-    def cleanup_inactive_clients(self):
-        """Remove clients that haven't sent heartbeat recently"""
-        while True:
-            try:
-                now = time.time()
-                inactive_clients = [
-                    client_id for client_id, last_seen in self.clients_last_seen.items()
-                    if now - last_seen > HEARTBEAT_TIMEOUT
-                ]
-                
-                for client_id in inactive_clients:
-                    logger.info(f"Removing inactive client: {client_id}")
-                    del self.clients_last_seen[client_id]
-                    
-                time.sleep(HEARTBEAT_TIMEOUT)
-            except Exception as e:
-                logger.error(f"Error in client cleanup: {e}")
-                time.sleep(5)
-
-    def cleanup_old_commands(self):
-        """Remove old pending commands to prevent memory leaks"""
-        while True:
-            try:
-                now = time.time()
-                with self.command_lock:
-                    expired_commands = [
-                        cmd_id for cmd_id, cmd_data in self.pending_commands.items()
-                        if now - cmd_data["timestamp"] > ACK_TIMEOUT * 2
-                    ]
-                    
-                    for cmd_id in expired_commands:
-                        logger.info(f"Cleaning up expired command: {cmd_id}")
-                        del self.pending_commands[cmd_id]
-                        
-                time.sleep(ACK_TIMEOUT)
-            except Exception as e:
-                logger.error(f"Error in command cleanup: {e}")
-                time.sleep(5)
-
-    def publish_with_retry(self, topic: str, message: str, qos: int = 1, retain: bool = False) -> bool:
-        """Publish MQTT message with retry logic"""
-        for attempt in range(MAX_RETRY_ATTEMPTS):
-            try:
-                result = self.mqtt_client.publish(topic, message, qos=qos, retain=retain)
-                if result.rc == mqtt.MQTT_ERR_SUCCESS:
-                    logger.debug(f"MQTT publish successful (attempt {attempt + 1})")
-                    return True
-                else:
-                    logger.warning(f"MQTT publish failed (attempt {attempt + 1}): rc={result.rc}")
-            except Exception as e:
-                logger.error(f"MQTT publish exception (attempt {attempt + 1}): {e}")
-            
-            if attempt < MAX_RETRY_ATTEMPTS - 1:
-                time.sleep(RETRY_DELAY)
-        
-        logger.error(f"Failed to publish to {topic} after {MAX_RETRY_ATTEMPTS} attempts")
-        return False
-
-    def send_video_command(self, video_index: int, delay: float = 4.0) -> Optional[str]:
-        """Send video play command to all clients"""
-        if not (0 <= video_index < len(self.video_files)):
-            return None
-            
-        command_id = str(uuid.uuid4())
-        start_time = time.time() + delay
-        
-        # Store command for tracking
-        with self.command_lock:
-            self.pending_commands[command_id] = {
-                "video_index": video_index,
-                "start_time": start_time,
-                "timestamp": time.time(),
-                "expected_clients": len(self.clients_last_seen),
-                "acks": {}
-            }
-        
-        # Prepare message
-        message = f"{video_index},{start_time},{command_id}"
-        logger.info(f"Sending video command: {message}")
-        
-        # Send with retry logic
-        success = self.publish_with_retry(MQTT_TOPIC_PLAY, message, qos=1)
-        
-        if success:
-            # Also send with retain flag for late-joining clients
-            self.publish_with_retry(MQTT_TOPIC_PLAY, message, qos=1, retain=True)
-            
-            # Clear retained message after delay
-            def clear_retained():
-                time.sleep(2.0)
-                self.publish_with_retry(MQTT_TOPIC_PLAY, "", retain=True)
-            
-            threading.Thread(target=clear_retained, daemon=True).start()
-            return command_id
-        
-        return None
-
-    def get_command_status(self, command_id: str) -> Optional[dict]:
-        """Get status of a pending command"""
-        with self.command_lock:
-            if command_id not in self.pending_commands:
-                return None
-                
-            cmd_data = self.pending_commands[command_id]
-            acks = cmd_data.get("acks", {})
-            
-            success_count = sum(1 for ack in acks.values() if ack["status"] == "success")
-            error_count = sum(1 for ack in acks.values() if ack["status"] == "error")
-            total_responses = len(acks)
-            expected_clients = cmd_data["expected_clients"]
-            time_elapsed = time.time() - cmd_data["timestamp"]
-            
-            completed = (total_responses >= expected_clients) or (time_elapsed > ACK_TIMEOUT)
-            
-            return {
-                "completed": completed,
-                "success_count": success_count,
-                "error_count": error_count,
-                "total_responses": total_responses,
-                "expected_clients": expected_clients,
-                "time_elapsed": time_elapsed
-            }
-
-    def setup_routes(self):
-        """Setup Flask routes"""
-        
-        @self.app.route("/")
-        def index():
-            self.update_video_list()
-            buttons_html = "\n".join(
-                f'<button class="video-btn" data-index="{i}">{v}</button>'
-                for i, v in enumerate(self.video_files)
+def update_video_list():
+    global video_files
+    try:
+        if os.path.exists(VIDEO_DIR):
+            video_files = sorted(
+                [f for f in os.listdir(VIDEO_DIR) if f.lower().endswith(VIDEO_EXTENSIONS)]
             )
+            logger.info(f"Found {len(video_files)} videos: {video_files[:3]}{'...' if len(video_files) > 3 else ''}")
+        else:
+            logger.warning(f"Video directory {VIDEO_DIR} does not exist")
+            video_files = []
+    except Exception as e:
+        logger.error(f"Error updating video list: {e}")
+        video_files = []
+
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        logger.info("✅ Connected to MQTT Broker successfully")
+        client.subscribe(MQTT_TOPIC_HEARTBEAT)
+        client.subscribe(MQTT_TOPIC_ACK)
+    else:
+        logger.error(f"❌ Failed to connect to MQTT Broker, return code {rc}")
+
+def on_disconnect(client, userdata, rc):
+    if rc != 0:
+        logger.warning(f"🔌 Unexpected MQTT disconnection, return code {rc}")
+
+def on_message(client, userdata, msg):
+    try:
+        topic = msg.topic
+        # Safely decode payload with error handling
+        try:
+            payload = msg.payload.decode('utf-8')
+        except UnicodeDecodeError:
+            logger.warning(f"⚠️ Failed to decode message from {topic}, skipping")
+            return
             
-            # Enhanced HTML with better error handling and accessibility
-            html = f"""
+        logger.debug(f"📨 Received: {topic} -> {payload}")
+        
+        if topic == MQTT_TOPIC_HEARTBEAT:
+            # Handle heartbeat - keep original simple format
+            client_id = payload.strip()
+            if client_id:  # Only process non-empty client IDs
+                clients_last_seen[client_id] = time.time()
+                logger.debug(f"💓 Heartbeat from: {client_id}")
+        
+        elif topic == MQTT_TOPIC_ACK:
+            # Handle acknowledgment: format is "client_id:command_id:status"
+            try:
+                parts = payload.split(":")
+                if len(parts) >= 3:
+                    client_id = parts[0].strip()
+                    command_id = parts[1].strip()  
+                    status = parts[2].strip()
+                    
+                    with command_lock:
+                        if command_id in pending_commands:
+                            if "acks" not in pending_commands[command_id]:
+                                pending_commands[command_id]["acks"] = {}
+                            pending_commands[command_id]["acks"][client_id] = {
+                                "status": status,
+                                "timestamp": time.time()
+                            }
+                            logger.info(f"✅ ACK from {client_id} for {command_id}: {status}")
+                        else:
+                            logger.debug(f"🤷 ACK for unknown command: {command_id}")
+                else:
+                    logger.warning(f"⚠️ Invalid ACK format: {payload}")
+            except Exception as e:
+                logger.error(f"❌ Error parsing ACK '{payload}': {e}")
+                
+    except Exception as e:
+        logger.error(f"❌ Error in on_message: {e}")
+
+def cleanup_clients():
+    """Remove inactive clients - with better error handling"""
+    while True:
+        try:
+            now = time.time()
+            to_remove = []
+            for cid, last in clients_last_seen.items():
+                if now - last > HEARTBEAT_TIMEOUT:
+                    logger.info(f"🗑️ Removing inactive client: {cid}")
+                    to_remove.append(cid)
+            
+            for cid in to_remove:
+                del clients_last_seen[cid]
+                
+            time.sleep(HEARTBEAT_TIMEOUT // 2)  # Check more frequently
+        except Exception as e:
+            logger.error(f"❌ Error in cleanup_clients: {e}")
+            time.sleep(5)
+
+def cleanup_old_commands():
+    """Clean up old pending commands - with better error handling"""
+    while True:
+        try:
+            now = time.time()
+            with command_lock:
+                to_remove = []
+                for cmd_id, cmd_data in pending_commands.items():
+                    if now - cmd_data["timestamp"] > ACK_TIMEOUT * 3:  # Give more time
+                        to_remove.append(cmd_id)
+                
+                for cmd_id in to_remove:
+                    logger.debug(f"🧹 Cleaning up old command: {cmd_id}")
+                    del pending_commands[cmd_id]
+                    
+            time.sleep(ACK_TIMEOUT)
+        except Exception as e:
+            logger.error(f"❌ Error in cleanup_old_commands: {e}")
+            time.sleep(5)
+
+@app.route("/")
+def index():
+    update_video_list()
+    buttons_html = "\n".join(
+        f'<button class="video-btn" data-index="{i}">{v}</button>'
+        for i, v in enumerate(video_files)
+    )
+    
+    # Keep the original HTML structure but with minor improvements
+    html = f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Stepmom TV Control</title>
+<title>Stepmom TV</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Baloo+2:wght@400;600&display=swap');
-  
-  * {{
-    box-sizing: border-box;
-  }}
-  
+  @import url('https://fonts.googleapis.com/css2?family=Baloo+2&display=swap');
   body {{
-    background: linear-gradient(135deg, #ffeaa7, #fd79a8);
+    background-color: lightpink;
     font-family: 'Baloo 2', cursive;
     text-align: center;
     padding: 20px;
-    min-height: 100vh;
-    margin: 0;
   }}
-  
-  .container {{
-    max-width: 800px;
-    margin: 0 auto;
-    background: rgba(255, 255, 255, 0.1);
-    backdrop-filter: blur(10px);
-    border-radius: 20px;
-    padding: 30px;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
-  }}
-  
   h1 {{
     font-size: 3em;
     margin-bottom: 0.5em;
-    color: #2d3436;
-    font-weight: 600;
-    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.1);
+    color: #d147a3;
   }}
-  
-  .client-info {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    background: rgba(255, 255, 255, 0.2);
-    padding: 15px;
-    border-radius: 15px;
-    margin-bottom: 20px;
-    font-size: 1.1em;
-    color: #2d3436;
+  .client-count {{
+    font-size: 1.2em;
+    margin-bottom: 1em;
+    color: #7a1e63;
+    background: rgba(255,255,255,0.3);
+    padding: 10px;
+    border-radius: 10px;
+    display: inline-block;
   }}
-  
-  .video-grid {{
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-    gap: 15px;
-    margin: 20px 0;
-  }}
-  
   .video-btn {{
-    background: linear-gradient(135deg, #6c5ce7, #a29bfe);
+    background-color: #ff6f91;
     border: none;
     border-radius: 15px;
     color: white;
-    font-size: 1.1em;
-    font-weight: 600;
-    padding: 20px 15px;
+    font-size: 1.3em;
+    padding: 15px 30px;
+    margin: 10px;
     cursor: pointer;
-    transition: all 0.3s ease;
-    box-shadow: 0 4px 15px rgba(108, 92, 231, 0.3);
-    word-break: break-word;
+    transition: background-color 0.3s;
   }}
-  
-  .video-btn:hover:not(:disabled) {{
-    transform: translateY(-2px);
-    box-shadow: 0 6px 20px rgba(108, 92, 231, 0.4);
+  .video-btn:hover {{
+    background-color: #ff4a75;
   }}
-  
-  .video-btn:active {{
-    transform: translateY(0);
-  }}
-  
   .video-btn:disabled {{
-    background: #95a5a6;
+    background-color: #cccccc;
     cursor: not-allowed;
-    transform: none;
-    box-shadow: none;
   }}
-  
   .status-message {{
     font-size: 1.1em;
-    margin: 15px 0;
-    padding: 15px;
-    border-radius: 15px;
+    margin: 10px;
+    padding: 10px;
+    border-radius: 10px;
     display: none;
-    font-weight: 600;
   }}
-  
   .status-success {{
-    background: linear-gradient(135deg, #00b894, #55efc4);
-    color: white;
+    background-color: #d4edda;
+    color: #155724;
   }}
-  
   .status-error {{
-    background: linear-gradient(135deg, #e17055, #fab1a0);
-    color: white;
+    background-color: #f8d7da;
+    color: #721c24;
   }}
-  
   .status-warning {{
-    background: linear-gradient(135deg, #fdcb6e, #f39c12);
+    background-color: #fff3cd;
+    color: #856404;
+  }}
+  .debug-info {{
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    background: rgba(0,0,0,0.8);
     color: white;
-  }}
-  
-  .loading {{
-    display: inline-block;
-    width: 20px;
-    height: 20px;
-    border: 3px solid rgba(255,255,255,.3);
-    border-radius: 50%;
-    border-top-color: #fff;
-    animation: spin 1s ease-in-out infinite;
-    margin-left: 10px;
-  }}
-  
-  @keyframes spin {{
-    to {{ transform: rotate(360deg); }}
-  }}
-  
-  @media (max-width: 600px) {{
-    .container {{
-      margin: 10px;
-      padding: 20px;
-    }}
-    
-    h1 {{
-      font-size: 2em;
-    }}
-    
-    .client-info {{
-      flex-direction: column;
-      gap: 10px;
-    }}
-    
-    .video-grid {{
-      grid-template-columns: 1fr;
-    }}
+    padding: 5px 10px;
+    border-radius: 5px;
+    font-size: 0.8em;
+    font-family: monospace;
   }}
 </style>
 </head>
 <body>
-  <div class="container">
-    <h1>🎬 Stepmom TV Control</h1>
-    
-    <div class="client-info">
-      <div>📱 Connected Clients: <span id="clientCount">0</span></div>
-      <div>🎥 Available Videos: {len(self.video_files)}</div>
-    </div>
-    
-    <div id="status-message" class="status-message"></div>
-    
-    <div class="video-grid" id="buttons-container">
-      {buttons_html}
-    </div>
+  <h1>Stepmom TV</h1>
+  
+  <!-- Debug info for troubleshooting -->
+  <div class="debug-info" id="debug-info">
+    Status: Loading...
   </div>
+  
+  <div class="client-count">
+    Connected Clients: <span id="clientCount">0</span> | 
+    Videos Available: {len(video_files)}
+  </div>
+  
+  <div id="status-message" class="status-message"></div>
+  <div id="buttons-container">{buttons_html}</div>
 
-  <canvas id="confetti-canvas" style="position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:1000;"></canvas>
+  <canvas id="confetti-canvas" style="position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;"></canvas>
 
 <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.5.1/dist/confetti.browser.min.js"></script>
 <script>
   const buttons = document.querySelectorAll('.video-btn');
   const clientCountSpan = document.getElementById('clientCount');
   const statusMessage = document.getElementById('status-message');
+  const debugInfo = document.getElementById('debug-info');
   let lastClickTime = 0;
-  let isProcessing = false;
 
-  function showStatus(message, type, showLoading = false) {{
-    statusMessage.innerHTML = message + (showLoading ? '<span class="loading"></span>' : '');
+  function updateDebugInfo(info) {{
+    debugInfo.textContent = `${{new Date().toLocaleTimeString()}} - ${{info}}`;
+  }}
+
+  function showStatus(message, type) {{
+    statusMessage.textContent = message;
     statusMessage.className = `status-message status-${{type}}`;
     statusMessage.style.display = 'block';
+    updateDebugInfo(`Status: ${{type}} - ${{message}}`);
     
-    if (!showLoading) {{
-      setTimeout(() => {{
-        statusMessage.style.display = 'none';
-      }}, 5000);
-    }}
+    setTimeout(() => {{
+      statusMessage.style.display = 'none';
+    }}, 5000);
   }}
 
   function disableButtons() {{
     buttons.forEach(btn => btn.disabled = true);
-    isProcessing = true;
   }}
 
   function enableButtons() {{
     buttons.forEach(btn => btn.disabled = false);
-    isProcessing = false;
   }}
 
   buttons.forEach(btn => {{
     btn.addEventListener('click', () => {{
-      if (isProcessing) return;
-      
       const now = Date.now();
-      if (now - lastClickTime < 3000) {{
-        const remaining = Math.ceil((3000 - (now - lastClickTime)) / 1000);
-        showStatus(`⏳ Please wait ${{remaining}} more second(s)`, 'warning');
+      // Keep original 5-second debounce
+      if (now - lastClickTime < 5000) {{
+        const remaining = Math.ceil((5000 - (now - lastClickTime)) / 1000);
+        showStatus(`Please wait ${{remaining}} more second(s) before selecting another video`, 'warning');
         return;
       }}
-      
       lastClickTime = now;
+
       const index = btn.getAttribute('data-index');
       const videoName = btn.textContent;
       
+      updateDebugInfo(`Sending: ${{videoName}}`);
       disableButtons();
-      showStatus(`🚀 Starting ${{videoName}}...`, 'warning', true);
+      showStatus(`Starting ${{videoName}}... sending command to clients`, 'warning');
 
-      fetch('/api/play', {{
+      fetch('/play', {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
         body: JSON.stringify({{ index: parseInt(index) }})
       }})
-      .then(resp => resp.json())
+      .then(resp => {{
+        if (!resp.ok) {{
+          throw new Error(`HTTP ${{resp.status}}`);
+        }}
+        return resp.json();
+      }})
       .then(data => {{
         if(data.status === 'success') {{
-          checkCommandStatus(data.command_id, videoName);
+          const commandId = data.command_id;
+          updateDebugInfo(`Command sent: ${{commandId}}`);
+          showStatus(`Command sent! Waiting for ${{videoName}} to start on clients...`, 'warning');
+          checkCommandStatus(commandId, videoName);
         }} else {{
-          showStatus(`❌ Error: ${{data.message}}`, 'error');
+          updateDebugInfo(`Error: ${{data.message}}`);
+          showStatus('Error: ' + data.message, 'error');
           enableButtons();
         }}
       }})
       .catch(err => {{
-        showStatus(`🔌 Network error: ${{err.message}}`, 'error');
+        updateDebugInfo(`Network error: ${{err.message}}`);
+        showStatus('Network error: ' + err.message, 'error');
         enableButtons();
       }});
     }});
@@ -495,14 +335,19 @@ class VideoControlSystem:
     const checkInterval = setInterval(() => {{
       attempts++;
       
-      fetch(`/api/command/status/${{commandId}}`)
-        .then(resp => resp.json())
+      fetch(`/command/status/${{commandId}}`)
+        .then(resp => {{
+          if (!resp.ok) throw new Error(`HTTP ${{resp.status}}`);
+          return resp.json();
+        }})
         .then(data => {{
+          updateDebugInfo(`Check ${{attempts}}: ${{data.total_responses}}/${{data.expected_clients}} responses`);
+          
           if (!data.completed) {{
             const elapsed = Math.floor(data.time_elapsed);
             const responses = data.total_responses;
             const expected = data.expected_clients;
-            showStatus(`📊 ${{videoName}}: ${{responses}}/${{expected}} responses (${{elapsed}}s)`, 'warning', true);
+            showStatus(`${{videoName}}: Got ${{responses}}/${{expected}} responses (${{elapsed}}s)`, 'warning');
           }}
           
           if (data.completed) {{
@@ -511,176 +356,235 @@ class VideoControlSystem:
             
             if (data.success_count > 0) {{
               const successMsg = data.error_count > 0 
-                ? `⚠️ ${{videoName}} started on ${{data.success_count}} client(s), ${{data.error_count}} failed`
-                : `✅ ${{videoName}} started successfully on ${{data.success_count}} client(s)!`;
+                ? `${{videoName}} started on ${{data.success_count}} client(s), ${{data.error_count}} failed`
+                : `${{videoName}} started successfully on ${{data.success_count}} client(s)!`;
               
               showStatus(successMsg, data.error_count > 0 ? 'warning' : 'success');
+              updateDebugInfo(`Complete: ${{data.success_count}} success, ${{data.error_count}} error`);
               
               if (data.error_count === 0) {{
                 confetti({{
-                  particleCount: 100,
-                  spread: 70,
-                  origin: {{ y: 0.6 }},
-                  colors: ['#6c5ce7', '#a29bfe', '#fd79a8', '#ffeaa7']
+                  particleCount: 150,
+                  spread: 60,
+                  origin: {{ y: 0.6 }}
                 }});
               }}
             }} else if (data.total_responses === 0) {{
-              showStatus(`📵 No clients responded - check connections`, 'error');
+              showStatus(`No clients responded to ${{videoName}} - check client connections`, 'error');
+              updateDebugInfo('No client responses');
             }} else {{
-              showStatus(`❌ All clients failed to start ${{videoName}}`, 'error');
+              showStatus(`All clients failed to start ${{videoName}}`, 'error');
+              updateDebugInfo('All clients failed');
             }}
           }} else if (attempts >= maxAttempts) {{
             clearInterval(checkInterval);
             enableButtons();
-            showStatus(`⏰ Timeout waiting for ${{videoName}} responses`, 'error');
+            updateDebugInfo('Timeout reached');
+            
+            if (data.total_responses > 0) {{
+              showStatus(`${{videoName}}: Partial success - ${{data.success_count}} clients started`, 'warning');
+            }} else {{
+              showStatus(`Timeout waiting for clients to respond to ${{videoName}}`, 'error');
+            }}
           }}
         }})
         .catch(err => {{
+          console.error('Status check error:', err);
+          updateDebugInfo(`Status error: ${{err.message}}`);
           if (attempts >= maxAttempts) {{
             clearInterval(checkInterval);
             enableButtons();
-            showStatus('❌ Status check failed', 'error');
+            showStatus('Error checking command status', 'error');
           }}
         }});
     }}, 1000);
   }}
 
   function updateClientCount() {{
-    fetch('/api/clients/count')
-      .then(response => response.json())
+    fetch('/clients/count')
+      .then(response => {{
+        if (!response.ok) throw new Error('Network error');
+        return response.json();
+      }})
       .then(data => {{
         clientCountSpan.textContent = data.count;
+        updateDebugInfo(`Clients: ${{data.count}}`);
       }})
-      .catch(() => {{
+      .catch(err => {{
         clientCountSpan.textContent = '?';
+        updateDebugInfo(`Client count error: ${{err.message}}`);
       }});
   }}
 
-  // Initial update and periodic refresh
+  // Initial setup
+  updateDebugInfo('Initializing...');
   updateClientCount();
-  setInterval(updateClientCount, 3000);
+  setInterval(updateClientCount, 5000);
 </script>
 </body>
 </html>
 """
-            return Response(html, mimetype="text/html")
+    return Response(html, mimetype="text/html")
 
-        @self.app.route("/api/play", methods=["POST"])
-        def api_play():
+@app.route("/play", methods=["POST"])
+def play():
+    try:
+        data = request.json
+        video_index = data.get("index")
+        
+        if video_index is None or not (0 <= video_index < len(video_files)):
+            logger.warning(f"⚠️ Invalid video index: {video_index}")
+            return jsonify({"status": "error", "message": "Invalid video index"}), 400
+        
+        if not clients_last_seen:
+            logger.warning("⚠️ No clients connected")
+            return jsonify({"status": "error", "message": "No clients connected"}), 400
+        
+        # Use ORIGINAL timestamp-based command ID for compatibility
+        command_id = f"{int(time.time())}{video_index}"
+        start_time = time.time() + 4  # Keep original 4-second delay
+        
+        # Store command for tracking
+        with command_lock:
+            pending_commands[command_id] = {
+                "video_index": video_index,
+                "start_time": start_time,
+                "timestamp": time.time(),
+                "expected_clients": len(clients_last_seen),
+                "acks": {}
+            }
+        
+        # Use ORIGINAL message format that your clients expect
+        message = f"{video_index},{start_time},{command_id}"
+        logger.info(f"📤 Sending command: {message}")
+        
+        # Keep original retry logic but with better error handling
+        success_count = 0
+        for attempt in range(3):
             try:
-                data = request.json
-                video_index = data.get("index")
-                
-                if video_index is None or not (0 <= video_index < len(self.video_files)):
-                    return jsonify({"status": "error", "message": "Invalid video index"}), 400
-                
-                if not self.clients_last_seen:
-                    return jsonify({"status": "error", "message": "No clients connected"}), 400
-                
-                command_id = self.send_video_command(video_index)
-                
-                if command_id:
-                    return jsonify({"status": "success", "command_id": command_id})
+                result = mqtt_client.publish(MQTT_TOPIC_PLAY, message, qos=1)
+                if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                    logger.debug(f"✅ MQTT publish attempt {attempt + 1}/3: SUCCESS")
+                    success_count += 1
                 else:
-                    return jsonify({"status": "error", "message": "Failed to send command"}), 500
-                    
+                    logger.warning(f"⚠️ MQTT publish attempt {attempt + 1}/3: FAILED (rc={result.rc})")
             except Exception as e:
-                logger.error(f"Error in play endpoint: {e}")
-                return jsonify({"status": "error", "message": "Internal server error"}), 500
+                logger.error(f"❌ MQTT publish attempt {attempt + 1}/3: EXCEPTION {e}")
+            
+            if attempt < 2:  # Small delay between retries
+                time.sleep(0.2)
+        
+        # Also publish with retain flag (original behavior)
+        try:
+            mqtt_client.publish(MQTT_TOPIC_PLAY, message, qos=1, retain=True)
+            logger.debug("📌 Published with retain flag")
+            # Clear retained message after delay
+            threading.Timer(2.0, lambda: mqtt_client.publish(MQTT_TOPIC_PLAY, "", retain=True)).start()
+        except Exception as e:
+            logger.error(f"❌ Failed to publish with retain: {e}")
+        
+        if success_count > 0:
+            logger.info(f"✅ Command sent successfully ({success_count}/3 attempts)")
+            return jsonify({"status": "success", "command_id": command_id})
+        else:
+            logger.error("❌ All MQTT publish attempts failed")
+            return jsonify({"status": "error", "message": "Failed to send MQTT command"}), 500
+            
+    except Exception as e:
+        logger.error(f"❌ Error in play endpoint: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
 
-        @self.app.route("/api/command/status/<command_id>")
-        def api_command_status(command_id):
-            try:
-                status = self.get_command_status(command_id)
-                if status is None:
-                    return jsonify({"error": "Command not found"}), 404
-                return jsonify(status)
-            except Exception as e:
-                logger.error(f"Error getting command status: {e}")
-                return jsonify({"error": "Internal server error"}), 500
-
-        @self.app.route("/api/clients/count")
-        def api_clients_count():
-            return jsonify({"count": len(self.clients_last_seen)})
-
-        @self.app.route("/api/debug/commands")
-        def api_debug_commands():
-            """Debug endpoint for monitoring commands"""
-            with self.command_lock:
-                return jsonify({
-                    "pending_commands": self.pending_commands,
-                    "total_commands": len(self.pending_commands)
-                })
-
-        @self.app.route("/api/health")
-        def api_health():
-            """Health check endpoint"""
+@app.route("/command/status/<command_id>")
+def command_status(command_id):
+    try:
+        with command_lock:
+            if command_id not in pending_commands:
+                logger.warning(f"⚠️ Command not found: {command_id}")
+                return jsonify({"error": "Command not found"}), 404
+            
+            cmd_data = pending_commands[command_id]
+            acks = cmd_data.get("acks", {})
+            
+            success_count = sum(1 for ack in acks.values() if ack["status"] == "success")
+            error_count = sum(1 for ack in acks.values() if ack["status"] == "error")
+            total_responses = len(acks)
+            expected_clients = cmd_data["expected_clients"]
+            
+            time_elapsed = time.time() - cmd_data["timestamp"]
+            completed = (total_responses >= expected_clients) or (time_elapsed > ACK_TIMEOUT)
+            
             return jsonify({
-                "status": "healthy",
-                "timestamp": datetime.now().isoformat(),
-                "mqtt_connected": self.mqtt_client.is_connected(),
-                "video_count": len(self.video_files),
-                "client_count": len(self.clients_last_seen)
+                "completed": completed,
+                "success_count": success_count,
+                "error_count": error_count,
+                "total_responses": total_responses,
+                "expected_clients": expected_clients,
+                "time_elapsed": time_elapsed
             })
+    except Exception as e:
+        logger.error(f"❌ Error getting command status: {e}")
+        return jsonify({"error": "Internal server error"}), 500
 
-    def start_background_tasks(self):
-        """Start background monitoring tasks"""
-        
-        # Client cleanup task
-        cleanup_thread = threading.Thread(target=self.cleanup_inactive_clients, daemon=True)
-        cleanup_thread.start()
-        
-        # Command cleanup task
-        command_cleanup_thread = threading.Thread(target=self.cleanup_old_commands, daemon=True)
-        command_cleanup_thread.start()
-        
-        logger.info("Background tasks started")
+@app.route("/clients/count")
+def clients_count():
+    return jsonify({"count": len(clients_last_seen)})
 
-    def connect_mqtt(self):
-        """Connect to MQTT broker with retry logic"""
-        max_retries = 5
-        retry_delay = 5
-        
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Connecting to MQTT broker at {MQTT_BROKER}:{MQTT_PORT} (attempt {attempt + 1})")
-                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-                
-                # Start MQTT loop in background
-                mqtt_thread = threading.Thread(target=self.mqtt_client.loop_forever, daemon=True)
-                mqtt_thread.start()
-                
-                logger.info("MQTT connection established")
-                return True
-                
-            except Exception as e:
-                logger.error(f"MQTT connection attempt {attempt + 1} failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-        
-        logger.error("Failed to connect to MQTT broker after multiple attempts")
-        return False
+@app.route("/debug/commands")
+def debug_commands():
+    """Debug endpoint to see pending commands"""
+    try:
+        with command_lock:
+            return jsonify({
+                "pending_commands": pending_commands,
+                "total_commands": len(pending_commands),
+                "active_clients": list(clients_last_seen.keys())
+            })
+    except Exception as e:
+        logger.error(f"❌ Error in debug endpoint: {e}")
+        return jsonify({"error": str(e)}), 500
 
-    def run(self, host="0.0.0.0", port=5000, debug=False):
-        """Start the application"""
-        logger.info("Starting Video Control System")
-        
-        # Initialize video list
-        self.update_video_list()
-        
-        # Connect to MQTT
-        if not self.connect_mqtt():
-            logger.error("Cannot start without MQTT connection")
-            return
-        
-        # Start background tasks
-        self.start_background_tasks()
-        
-        # Start Flask app
-        logger.info(f"Starting web server on {host}:{port}")
-        self.app.run(host=host, port=port, debug=debug)
-
+@app.route("/health")
+def health_check():
+    """Simple health check"""
+    return jsonify({
+        "status": "healthy",
+        "mqtt_connected": mqtt_client.is_connected(),
+        "video_count": len(video_files),
+        "client_count": len(clients_last_seen),
+        "timestamp": time.time()
+    })
 
 if __name__ == "__main__":
-    system = VideoControlSystem()
-    system.run()
+    logger.info("🚀 Starting Stepmom TV Control System")
+    
+    # Initialize
+    update_video_list()
+    
+    # Setup MQTT with better error handling
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_message = on_message
+    mqtt_client.on_disconnect = on_disconnect
+    
+    try:
+        logger.info(f"🔌 Connecting to MQTT broker at {MQTT_BROKER}:1883")
+        mqtt_client.connect(MQTT_BROKER, 1883, 60)
+        
+        mqtt_thread = threading.Thread(target=mqtt_client.loop_forever, daemon=True)
+        mqtt_thread.start()
+        logger.info("✅ MQTT thread started")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to connect to MQTT: {e}")
+        exit(1)
+
+    # Start background threads
+    cleanup_thread = threading.Thread(target=cleanup_clients, daemon=True)
+    cleanup_thread.start()
+    logger.info("🧹 Client cleanup thread started")
+
+    command_cleanup_thread = threading.Thread(target=cleanup_old_commands, daemon=True)
+    command_cleanup_thread.start()
+    logger.info("🗑️ Command cleanup thread started")
+
+    logger.info("🌐 Starting Flask web server on 0.0.0.0:5000")
+    app.run(host="0.0.0.0", port=5000, debug=False)

@@ -5,348 +5,504 @@ import paho.mqtt.client as mqtt
 import vlc
 from datetime import datetime
 import uuid
+import json
+import logging
+from typing import Optional, List
+from enum import Enum
 
+# Configuration
 VIDEO_DIR = "/media/usb"
 MQTT_BROKER = "192.168.50.1"
 MQTT_TOPIC_PLAY = "video/play"
 MQTT_TOPIC_HEARTBEAT = "clients/status"
 MQTT_TOPIC_ACK = "video/ack"
+MQTT_TOPIC_STATUS = "clients/detailed_status"
 HEARTBEAT_INTERVAL = 5  # seconds
-
 CLIENT_ID = str(uuid.getnode())
 
-video_files = []
-player = None
-vlc_instance = vlc.Instance('--aout=alsa --no-audio')
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/tmp/video_client.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-looping_enabled = True
-looping_thread = None
-loop_lock = threading.Lock()
+class PlaybackState(Enum):
+    IDLE = "idle"
+    LOADING = "loading"
+    PLAYING = "playing"
+    LOOPING = "looping"
+    ERROR = "error"
 
-def send_heartbeat(client):
-    while True:
-        client.publish(MQTT_TOPIC_HEARTBEAT, CLIENT_ID)
-        time.sleep(HEARTBEAT_INTERVAL)
-
-def send_acknowledgment(client, command_id, status, message=""):
-    """Send acknowledgment back to brain"""
-    ack_payload = f"{CLIENT_ID}:{command_id}:{status}"
-    if message:
-        ack_payload += f":{message}"
-    client.publish(MQTT_TOPIC_ACK, ack_payload)
-    print(f"Sent ACK: {ack_payload}")
-
-def is_usb_mounted():
-    try:
-        with open("/proc/mounts", "r") as mounts:
-            return any(VIDEO_DIR in line for line in mounts)
-    except Exception:
-        return False
-
-def load_video_files():
-    global video_files
-    video_files = sorted([
-        f for f in os.listdir(VIDEO_DIR)
-        if f.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv'))
-    ])
-    print(f"Found videos: {video_files}")
-
-def setup_player():
-    global player
-    player = vlc_instance.media_player_new()
-    print("Player setup complete")
-
-def play_video(client, index, start_time, command_id):
-    global looping_enabled
-
-    try:
-        print(f"Received play command: index={index}, start_time={start_time}, command_id={command_id}")
+class VideoClient:
+    def __init__(self):
+        self.video_files: List[str] = []
+        self.player: Optional[vlc.MediaPlayer] = None
+        self.vlc_instance = vlc.Instance('--aout=alsa --no-audio --no-video-title')
         
-        # Validate index
-        if not (0 <= index < len(video_files)):
-            send_acknowledgment(client, command_id, "error", f"Invalid index {index}")
-            return
+        # State management
+        self.current_state = PlaybackState.IDLE
+        self.looping_enabled = True
+        self.current_video_index = 0
+        self.looping_thread: Optional[threading.Thread] = None
+        self.loop_lock = threading.Lock()
+        self.state_lock = threading.Lock()
         
-        file_path = os.path.join(VIDEO_DIR, video_files[index])
+        # Statistics
+        self.stats = {
+            'videos_played': 0,
+            'loop_cycles': 0,
+            'errors': 0,
+            'last_error': None,
+            'uptime_start': time.time()
+        }
         
-        # Check if file exists
-        if not os.path.exists(file_path):
-            send_acknowledgment(client, command_id, "error", f"File not found: {file_path}")
-            return
-
-        with loop_lock:
-            looping_enabled = False  # disable looping temporarily
-
-        print(f"Preparing to play video {file_path} at {start_time}")
-
-        # IMPROVED VLC STATE MANAGEMENT
-        # Force stop any current playback
-        player.stop()
+        # MQTT client
+        self.mqtt_client: Optional[mqtt.Client] = None
+        self.connected = False
         
-        # Wait for VLC to fully stop - check multiple states
-        print("Waiting for VLC to stop...")
-        stop_timeout = 0
-        while stop_timeout < 50:  # 5 second timeout
-            state = player.get_state()
-            if state in [vlc.State.Stopped, vlc.State.Ended, vlc.State.NothingSpecial]:
-                break
-            print(f"VLC state: {state}, waiting...")
-            time.sleep(0.1)
-            stop_timeout += 1
-        
-        if stop_timeout >= 50:
-            print("Warning: VLC didn't stop cleanly, continuing anyway")
-        else:
-            print(f"VLC stopped successfully after {stop_timeout * 0.1:.1f}s")
-
-        # Additional wait for VLC internal cleanup
-        time.sleep(0.3)
-
-        # Clear any existing media
-        player.set_media(None)
-        time.sleep(0.1)
-
-        # Set up new media
-        print(f"Loading media: {file_path}")
-        media = vlc_instance.media_new(file_path)
-        player.set_media(media)
-        
-        # Wait for media to be set
-        time.sleep(0.2)
-        
-        # Start playback with retry logic
-        play_attempts = 0
-        play_success = False
-        
-        while play_attempts < 3 and not play_success:
-            play_attempts += 1
-            print(f"Play attempt {play_attempts}/3")
-            
-            result = player.play()
-            if result == -1:
-                print(f"VLC play() returned error on attempt {play_attempts}")
-                time.sleep(0.5)
-                continue
-                
-            # Wait for playback to actually start
-            start_timeout = 0
-            while start_timeout < 30:  # 3 second timeout
-                if player.is_playing():
-                    play_success = True
-                    break
-                time.sleep(0.1)
-                start_timeout += 1
-            
-            if not play_success:
-                print(f"Playback didn't start on attempt {play_attempts}")
-                if play_attempts < 3:
-                    player.stop()
-                    time.sleep(0.5)
-        
-        if not play_success:
-            send_acknowledgment(client, command_id, "error", "VLC failed to start playback after 3 attempts")
-            with loop_lock:
-                looping_enabled = True
-            return
-        
-        print(f"Playback started successfully after {play_attempts} attempts")
-        
-        # Calculate wait time for synchronized start
-        wait_seconds = start_time - time.time()
-        if wait_seconds > 0:
-            print(f"Waiting {wait_seconds:.2f} seconds for synchronized start...")
-            time.sleep(wait_seconds)
-        elif wait_seconds < -1:  # If we're more than 1 second late
-            print(f"Warning: Starting {abs(wait_seconds):.2f} seconds late")
-
-        # Final verification that we're still playing
-        if player.is_playing():
-            send_acknowledgment(client, command_id, "success", f"Playing {video_files[index]}")
-            print(f"Successfully synchronized and playing: {file_path}")
-        else:
-            send_acknowledgment(client, command_id, "error", "Playback stopped unexpectedly before sync")
-            print("Error: Playback stopped before synchronization")
-            with loop_lock:
-                looping_enabled = True
-            return
-
-        # Monitor playback
-        while player.is_playing():
-            time.sleep(1)
-
-        print("Manual video finished. Resuming loop...")
-        time.sleep(1)
-
-        with loop_lock:
-            looping_enabled = True  # allow loop again
-
-    except Exception as e:
-        error_msg = f"Exception in play_video: {str(e)}"
-        print(error_msg)
-        send_acknowledgment(client, command_id, "error", error_msg)
-        with loop_lock:
-            looping_enabled = True
-
-def play_looping_index_zero():
-    def loop():
-        global looping_enabled
-        consecutive_failures = 0
-        max_consecutive_failures = 5
-        
-        while True:
-            with loop_lock:
-                if not looping_enabled:
-                    time.sleep(1)
-                    continue
-
-            if len(video_files) == 0:
-                print("[Loop] No videos to play.")
-                time.sleep(5)
-                continue
-
-            file_path = os.path.join(VIDEO_DIR, video_files[0])
-            if not os.path.exists(file_path):
-                print("[Loop] Index 0 video missing.")
-                time.sleep(5)
-                continue
-
-            print(f"[Loop] Playing {file_path}")
-            
+    def get_status(self) -> dict:
+        """Get detailed client status"""
+        with self.state_lock:
+            return {
+                'client_id': CLIENT_ID,
+                'state': self.current_state.value,
+                'video_count': len(self.video_files),
+                'current_video': self.video_files[self.current_video_index] if self.video_files else None,
+                'looping_enabled': self.looping_enabled,
+                'is_playing': self.player.is_playing() if self.player else False,
+                'usb_mounted': self.is_usb_mounted(),
+                'uptime': time.time() - self.stats['uptime_start'],
+                'stats': self.stats.copy()
+            }
+    
+    def set_state(self, new_state: PlaybackState):
+        """Thread-safe state setting"""
+        with self.state_lock:
+            if self.current_state != new_state:
+                logger.info(f"State change: {self.current_state.value} -> {new_state.value}")
+                self.current_state = new_state
+    
+    def send_heartbeat(self):
+        """Enhanced heartbeat with status info"""
+        while self.connected:
             try:
-                # IMPROVED LOOPING WITH BETTER VLC HANDLING
-                # Stop any current playback cleanly
-                if player.is_playing():
-                    player.stop()
-                    time.sleep(0.2)
+                # Basic heartbeat
+                self.mqtt_client.publish(MQTT_TOPIC_HEARTBEAT, CLIENT_ID)
                 
-                # Clear and set new media
-                player.set_media(None)
+                # Detailed status (less frequent)
+                if int(time.time()) % 30 == 0:  # Every 30 seconds
+                    status = self.get_status()
+                    self.mqtt_client.publish(MQTT_TOPIC_STATUS, json.dumps(status))
+                    
+            except Exception as e:
+                logger.error(f"Heartbeat error: {e}")
+                
+            time.sleep(HEARTBEAT_INTERVAL)
+    
+    def send_acknowledgment(self, command_id: str, status: str, message: str = ""):
+        """Send acknowledgment back to brain"""
+        try:
+            ack_payload = f"{CLIENT_ID}:{command_id}:{status}"
+            if message:
+                ack_payload += f":{message}"
+            self.mqtt_client.publish(MQTT_TOPIC_ACK, ack_payload)
+            logger.info(f"Sent ACK: {ack_payload}")
+        except Exception as e:
+            logger.error(f"Failed to send ACK: {e}")
+    
+    def is_usb_mounted(self) -> bool:
+        """Check if USB is mounted"""
+        try:
+            with open("/proc/mounts", "r") as mounts:
+                return any(VIDEO_DIR in line for line in mounts)
+        except Exception as e:
+            logger.error(f"Error checking USB mount: {e}")
+            return False
+    
+    def load_video_files(self):
+        """Load and sort video files from USB"""
+        try:
+            if not os.path.exists(VIDEO_DIR):
+                logger.warning(f"Video directory {VIDEO_DIR} does not exist")
+                return
+                
+            all_files = os.listdir(VIDEO_DIR)
+            self.video_files = sorted([
+                f for f in all_files
+                if f.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm'))
+            ])
+            logger.info(f"Found {len(self.video_files)} videos: {self.video_files}")
+            
+            # Validate first video for looping
+            if self.video_files:
+                first_video_path = os.path.join(VIDEO_DIR, self.video_files[0])
+                if not os.path.exists(first_video_path):
+                    logger.error(f"First video file missing: {first_video_path}")
+                    
+        except Exception as e:
+            logger.error(f"Error loading video files: {e}")
+            self.stats['errors'] += 1
+            self.stats['last_error'] = str(e)
+    
+    def setup_player(self):
+        """Initialize VLC media player"""
+        try:
+            self.player = self.vlc_instance.media_player_new()
+            logger.info("VLC player initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to setup VLC player: {e}")
+            self.stats['errors'] += 1
+            self.stats['last_error'] = str(e)
+            raise
+    
+    def stop_player_safely(self) -> bool:
+        """Safely stop VLC player with timeout"""
+        if not self.player:
+            return True
+            
+        try:
+            # Stop playback
+            self.player.stop()
+            
+            # Wait for VLC to stop with timeout
+            timeout_count = 0
+            max_timeout = 50  # 5 seconds
+            
+            while timeout_count < max_timeout:
+                state = self.player.get_state()
+                if state in [vlc.State.Stopped, vlc.State.Ended, vlc.State.NothingSpecial]:
+                    logger.debug(f"VLC stopped after {timeout_count * 0.1:.1f}s")
+                    return True
+                    
+                time.sleep(0.1)
+                timeout_count += 1
+            
+            logger.warning("VLC didn't stop cleanly within timeout")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error stopping player: {e}")
+            return False
+    
+    def start_playback(self, file_path: str, max_attempts: int = 3) -> bool:
+        """Start VLC playback with retry logic"""
+        for attempt in range(max_attempts):
+            try:
+                logger.info(f"Starting playback attempt {attempt + 1}/{max_attempts}: {file_path}")
+                
+                # Clear any existing media
+                self.player.set_media(None)
                 time.sleep(0.1)
                 
-                media = vlc_instance.media_new(file_path)
-                player.set_media(media)
+                # Set new media
+                media = self.vlc_instance.media_new(file_path)
+                self.player.set_media(media)
                 time.sleep(0.2)
                 
-                # Try to start playback
-                play_result = player.play()
-                if play_result == -1:
-                    print("[Loop] VLC play() failed")
-                    consecutive_failures += 1
-                    if consecutive_failures >= max_consecutive_failures:
-                        print(f"[Loop] Too many consecutive failures ({consecutive_failures}), longer wait")
-                        time.sleep(10)
-                        consecutive_failures = 0
-                    else:
-                        time.sleep(2)
+                # Start playback
+                result = self.player.play()
+                if result == -1:
+                    logger.warning(f"VLC play() returned error on attempt {attempt + 1}")
+                    time.sleep(0.5)
                     continue
                 
                 # Wait for playback to start
-                start_wait = 0
-                while start_wait < 30 and not player.is_playing():
+                start_timeout = 0
+                while start_timeout < 30:  # 3 second timeout
+                    if self.player.is_playing():
+                        logger.info(f"Playback started successfully on attempt {attempt + 1}")
+                        return True
                     time.sleep(0.1)
-                    start_wait += 1
+                    start_timeout += 1
                 
-                if not player.is_playing():
-                    print("[Loop] Failed to start playback")
-                    consecutive_failures += 1
-                    time.sleep(2)
-                    continue
-                
-                # Reset failure counter on success
-                consecutive_failures = 0
-                print(f"[Loop] Successfully started playback")
-
-                # Monitor playback
-                while player.is_playing():
-                    # Check if we should stop looping
-                    with loop_lock:
-                        if not looping_enabled:
-                            print("[Loop] Manual video override - stopping loop")
-                            break
-                    time.sleep(1)
-
-                if looping_enabled:
-                    print("[Loop] Video ended naturally, restarting...")
-                    time.sleep(0.5)  # Brief pause between loops
+                logger.warning(f"Playback didn't start on attempt {attempt + 1}")
+                if attempt < max_attempts - 1:
+                    self.stop_player_safely()
+                    time.sleep(0.5)
                     
             except Exception as e:
-                print(f"[Loop] Exception: {e}")
-                consecutive_failures += 1
-                if consecutive_failures >= max_consecutive_failures:
-                    print(f"[Loop] Too many failures, waiting longer...")
-                    time.sleep(10)
-                    consecutive_failures = 0
-                else:
-                    time.sleep(5)
-
-    global looping_thread
-    looping_thread = threading.Thread(target=loop, daemon=True)
-    looping_thread.start()
-    print("Started improved loop of index 0")
-
-def on_connect(client, userdata, flags, rc):
-    print("Connected to MQTT Broker")
-    client.subscribe(MQTT_TOPIC_PLAY)
-    threading.Thread(target=send_heartbeat, args=(client,), daemon=True).start()
-
-def on_message(client, userdata, msg):
-    try:
-        payload = msg.payload.decode()
-        print(f"Received MQTT message: {payload}")
+                logger.error(f"Playback attempt {attempt + 1} failed: {e}")
+                if attempt < max_attempts - 1:
+                    time.sleep(0.5)
         
-        parts = payload.split(",")
-        if len(parts) >= 3:
-            index = int(parts[0])
-            start_time = float(parts[1])
-            command_id = parts[2]
+        return False
+    
+    def play_video(self, index: int, start_time: float, command_id: str):
+        """Play a specific video with synchronization"""
+        try:
+            self.set_state(PlaybackState.LOADING)
+            logger.info(f"Play command: index={index}, start_time={start_time}, command_id={command_id}")
             
-            # Process command in separate thread to avoid blocking MQTT
-            threading.Thread(
-                target=play_video, 
-                args=(client, index, start_time, command_id), 
-                daemon=True
-            ).start()
+            # Validate index
+            if not (0 <= index < len(self.video_files)):
+                error_msg = f"Invalid video index {index} (available: 0-{len(self.video_files)-1})"
+                logger.error(error_msg)
+                self.send_acknowledgment(command_id, "error", error_msg)
+                self.set_state(PlaybackState.ERROR)
+                return
+            
+            file_path = os.path.join(VIDEO_DIR, self.video_files[index])
+            
+            # Check file exists
+            if not os.path.exists(file_path):
+                error_msg = f"Video file not found: {file_path}"
+                logger.error(error_msg)
+                self.send_acknowledgment(command_id, "error", error_msg)
+                self.set_state(PlaybackState.ERROR)
+                return
+            
+            # Disable looping temporarily
+            with self.loop_lock:
+                self.looping_enabled = False
+            
+            # Stop current playback
+            if not self.stop_player_safely():
+                logger.warning("Player didn't stop cleanly, continuing anyway")
+            
+            time.sleep(0.3)  # Additional cleanup time
+            
+            # Start new playback
+            if not self.start_playback(file_path):
+                error_msg = "Failed to start video playback"
+                logger.error(error_msg)
+                self.send_acknowledgment(command_id, "error", error_msg)
+                self.set_state(PlaybackState.ERROR)
+                with self.loop_lock:
+                    self.looping_enabled = True
+                return
+            
+            # Synchronization
+            wait_seconds = start_time - time.time()
+            if wait_seconds > 0:
+                logger.info(f"Waiting {wait_seconds:.2f}s for synchronization")
+                time.sleep(wait_seconds)
+            elif wait_seconds < -1:
+                logger.warning(f"Starting {abs(wait_seconds):.2f}s late")
+            
+            # Final verification
+            if self.player.is_playing():
+                self.set_state(PlaybackState.PLAYING)
+                self.current_video_index = index
+                self.stats['videos_played'] += 1
+                success_msg = f"Playing {self.video_files[index]}"
+                self.send_acknowledgment(command_id, "success", success_msg)
+                logger.info(f"Successfully synchronized: {file_path}")
+            else:
+                error_msg = "Playback stopped before synchronization"
+                logger.error(error_msg)
+                self.send_acknowledgment(command_id, "error", error_msg)
+                self.set_state(PlaybackState.ERROR)
+                with self.loop_lock:
+                    self.looping_enabled = True
+                return
+            
+            # Monitor playback until finished
+            while self.player.is_playing():
+                time.sleep(1)
+            
+            logger.info("Manual video finished, resuming loop")
+            time.sleep(1)
+            
+            # Re-enable looping
+            with self.loop_lock:
+                self.looping_enabled = True
+            
+            self.set_state(PlaybackState.LOOPING)
+            
+        except Exception as e:
+            error_msg = f"Exception in play_video: {str(e)}"
+            logger.error(error_msg)
+            self.send_acknowledgment(command_id, "error", error_msg)
+            self.set_state(PlaybackState.ERROR)
+            self.stats['errors'] += 1
+            self.stats['last_error'] = str(e)
+            with self.loop_lock:
+                self.looping_enabled = True
+    
+    def start_looping(self):
+        """Start the looping thread for index 0"""
+        def loop_thread():
+            consecutive_failures = 0
+            max_consecutive_failures = 5
+            
+            while True:
+                try:
+                    # Check if looping is enabled
+                    with self.loop_lock:
+                        if not self.looping_enabled:
+                            time.sleep(1)
+                            continue
+                    
+                    # Check if we have videos
+                    if not self.video_files:
+                        logger.warning("No videos available for looping")
+                        time.sleep(5)
+                        continue
+                    
+                    file_path = os.path.join(VIDEO_DIR, self.video_files[0])
+                    if not os.path.exists(file_path):
+                        logger.error("Loop video (index 0) missing")
+                        time.sleep(5)
+                        continue
+                    
+                    self.set_state(PlaybackState.LOOPING)
+                    
+                    # Start playback
+                    if not self.start_playback(file_path):
+                        consecutive_failures += 1
+                        logger.error(f"Loop playback failed (failure {consecutive_failures})")
+                        
+                        if consecutive_failures >= max_consecutive_failures:
+                            logger.error("Too many consecutive failures, longer wait")
+                            time.sleep(10)
+                            consecutive_failures = 0
+                        else:
+                            time.sleep(2)
+                        continue
+                    
+                    # Reset failure counter on success
+                    consecutive_failures = 0
+                    self.stats['loop_cycles'] += 1
+                    logger.info(f"Loop cycle {self.stats['loop_cycles']} started")
+                    
+                    # Monitor playback
+                    while self.player.is_playing():
+                        with self.loop_lock:
+                            if not self.looping_enabled:
+                                logger.info("Manual override - stopping loop")
+                                break
+                        time.sleep(1)
+                    
+                    if self.looping_enabled:
+                        logger.info("Loop video ended, restarting...")
+                        time.sleep(0.5)
+                        
+                except Exception as e:
+                    consecutive_failures += 1
+                    logger.error(f"Loop exception: {e}")
+                    self.stats['errors'] += 1
+                    self.stats['last_error'] = str(e)
+                    
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.error("Too many loop failures, extended wait")
+                        time.sleep(10)
+                        consecutive_failures = 0
+                    else:
+                        time.sleep(5)
+        
+        self.looping_thread = threading.Thread(target=loop_thread, daemon=True)
+        self.looping_thread.start()
+        logger.info("Started looping thread for index 0")
+    
+    def on_connect(self, client, userdata, flags, rc):
+        """MQTT connection callback"""
+        if rc == 0:
+            logger.info("Connected to MQTT broker")
+            self.connected = True
+            client.subscribe(MQTT_TOPIC_PLAY)
+            
+            # Start heartbeat thread
+            threading.Thread(target=self.send_heartbeat, daemon=True).start()
         else:
-            print(f"Invalid message format: {payload}")
+            logger.error(f"MQTT connection failed with code {rc}")
+            self.connected = False
+    
+    def on_disconnect(self, client, userdata, rc):
+        """MQTT disconnection callback"""
+        logger.warning(f"Disconnected from MQTT broker (code: {rc})")
+        self.connected = False
+    
+    def on_message(self, client, userdata, msg):
+        """MQTT message callback"""
+        try:
+            payload = msg.payload.decode()
+            logger.info(f"Received MQTT message: {payload}")
             
-    except Exception as e:
-        print(f"Error parsing message: {msg.payload}, {e}")
-
-def wait_for_usb_mount():
-    print("Waiting for USB mount...")
-    timeout = 30
-    start = time.time()
-    while not is_usb_mounted():
-        if time.time() - start > timeout:
-            print("ERROR: USB failed to mount after 30 seconds.")
-            return False
-        print("  USB not mounted yet...")
-        time.sleep(1)
-    print("USB is mounted.")
-    return True
+            parts = payload.split(",")
+            if len(parts) >= 3:
+                index = int(parts[0])
+                start_time = float(parts[1])
+                command_id = parts[2]
+                
+                # Process in separate thread
+                threading.Thread(
+                    target=self.play_video,
+                    args=(index, start_time, command_id),
+                    daemon=True
+                ).start()
+            else:
+                logger.error(f"Invalid message format: {payload}")
+                
+        except Exception as e:
+            logger.error(f"Error parsing MQTT message: {e}")
+            self.stats['errors'] += 1
+            self.stats['last_error'] = str(e)
+    
+    def wait_for_usb_mount(self, timeout: int = 30) -> bool:
+        """Wait for USB to be mounted"""
+        logger.info("Waiting for USB mount...")
+        start_time = time.time()
+        
+        while not self.is_usb_mounted():
+            if time.time() - start_time > timeout:
+                logger.error(f"USB failed to mount after {timeout} seconds")
+                return False
+            time.sleep(1)
+        
+        logger.info("USB mounted successfully")
+        return True
+    
+    def run(self):
+        """Main client loop"""
+        logger.info(f"=== Video Client Starting ===")
+        logger.info(f"Client ID: {CLIENT_ID}")
+        logger.info(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Wait for USB
+        if not self.wait_for_usb_mount():
+            logger.error("Exiting due to USB mount failure")
+            return
+        
+        # Load videos and setup player
+        self.load_video_files()
+        self.setup_player()
+        
+        # Start looping
+        self.start_looping()
+        
+        # Setup MQTT
+        self.mqtt_client = mqtt.Client()
+        self.mqtt_client.on_connect = self.on_connect
+        self.mqtt_client.on_disconnect = self.on_disconnect
+        self.mqtt_client.on_message = self.on_message
+        
+        # Connect to MQTT broker
+        try:
+            logger.info(f"Connecting to MQTT broker: {MQTT_BROKER}")
+            self.mqtt_client.connect(MQTT_BROKER)
+            self.mqtt_client.loop_forever()
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+        except Exception as e:
+            logger.error(f"MQTT connection failed: {e}")
+        finally:
+            self.connected = False
+            if self.player:
+                self.player.stop()
 
 def main():
-    print(f"== Client Startup: {datetime.now().strftime('%c')} ==")
-    print(f"Client ID: {CLIENT_ID}")
-
-    if not wait_for_usb_mount():
-        print("Exiting due to missing USB")
-        return
-
-    load_video_files()
-    setup_player()
-    play_looping_index_zero()
-
-    client = mqtt.Client()
-    client.on_connect = on_connect
-    client.on_message = on_message
-
+    """Main entry point"""
     try:
-        client.connect(MQTT_BROKER)
-        print("MQTT connect successful")
-        client.loop_forever()
+        client = VideoClient()
+        client.run()
     except Exception as e:
-        print(f"MQTT connection failed: {e}")
+        logger.critical(f"Critical error: {e}")
+        raise
 
 if __name__ == "__main__":
     main()
