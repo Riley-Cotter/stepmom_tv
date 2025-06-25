@@ -41,27 +41,23 @@ class PlaybackState(Enum):
 class VideoClient:
     def __init__(self):
         self.video_files: List[str] = []
+        self.player: Optional[vlc.MediaPlayer] = None
         self.vlc_instance = vlc.Instance('--aout=alsa --no-audio --no-video-title')
-        
-        # CRITICAL FIX: Separate players for different playback types
-        self.loop_player: Optional[vlc.MediaPlayer] = None
-        self.manual_player: Optional[vlc.MediaPlayer] = None
-        self.active_player: Optional[vlc.MediaPlayer] = None  # Track which player is active
         
         # State management
         self.current_state = PlaybackState.IDLE
         self.current_video_index = 0
         self.state_lock = threading.Lock()
         
-        # Manual playback control - single source of truth
-        self.playback_control_lock = threading.Lock()
-        self.manual_mode = False  # True = manual video playing, False = loop mode
-        self.manual_transition_time = 0  # When manual mode started
+        # IMPROVED: Single lock for all manual playback control
+        self.manual_control_lock = threading.Lock()
+        self.manual_playback_active = False
+        self.manual_start_time = 0
+        self.manual_video_playing = False  # NEW: Track if manual video is actually playing
         
         # Loop thread control
         self.looping_thread: Optional[threading.Thread] = None
-        self.loop_should_run = True
-        self.loop_pause_event = threading.Event()  # Signal to pause loop
+        self.loop_should_stop = threading.Event()  # NEW: Clean shutdown signal
         
         # Statistics
         self.stats = {
@@ -79,16 +75,15 @@ class VideoClient:
     def get_status(self) -> dict:
         """Get detailed client status"""
         with self.state_lock:
-            with self.playback_control_lock:
+            with self.manual_control_lock:
                 return {
                     'client_id': CLIENT_ID,
                     'state': self.current_state.value,
                     'video_count': len(self.video_files),
                     'current_video': self.video_files[self.current_video_index] if self.video_files else None,
-                    'manual_mode': self.manual_mode,
-                    'loop_paused': self.loop_pause_event.is_set(),
-                    'active_player': 'manual' if self.active_player == self.manual_player else 'loop' if self.active_player == self.loop_player else 'none',
-                    'is_playing': self.active_player.is_playing() if self.active_player else False,
+                    'manual_playback_active': self.manual_playback_active,
+                    'manual_video_playing': self.manual_video_playing,
+                    'is_playing': self.player.is_playing() if self.player else False,
                     'usb_mounted': self.is_usb_mounted(),
                     'uptime': time.time() - self.stats['uptime_start'],
                     'stats': self.stats.copy()
@@ -101,85 +96,18 @@ class VideoClient:
                 logger.info(f"State change: {self.current_state.value} -> {new_state.value}")
                 self.current_state = new_state
     
-    def switch_to_manual_mode(self) -> bool:
-        """Switch to manual playback mode - stops loop and prepares for manual video"""
-        with self.playback_control_lock:
-            if self.manual_mode:
-                logger.info("Already in manual mode")
-                return True
+    def is_manual_playback_active(self) -> tuple[bool, bool, float]:
+        """Check manual playback status with startup protection"""
+        with self.manual_control_lock:
+            if not self.manual_playback_active:
+                return False, False, 0
             
-            logger.info("=== SWITCHING TO MANUAL MODE ===")
+            current_time = time.time()
+            time_since_start = current_time - self.manual_start_time
+            # Extended startup protection: 10 seconds instead of 5
+            in_startup_protection = time_since_start < 10.0
             
-            # Step 1: Signal loop to pause
-            self.loop_pause_event.set()
-            self.manual_transition_time = time.time()
-            
-            # Step 2: Stop loop player if it's active
-            if self.active_player == self.loop_player and self.loop_player:
-                logger.info("Stopping loop player for manual override")
-                self.loop_player.stop()
-                
-                # Wait for loop player to stop
-                timeout = 0
-                while self.loop_player.is_playing() and timeout < 50:  # 5 second timeout
-                    time.sleep(0.1)
-                    timeout += 1
-                
-                if self.loop_player.is_playing():
-                    logger.warning("Loop player didn't stop cleanly")
-                else:
-                    logger.info("Loop player stopped successfully")
-            
-            # Step 3: Switch to manual mode
-            self.manual_mode = True
-            self.active_player = self.manual_player
-            
-            logger.info("Manual mode activated")
-            return True
-    
-    def switch_to_loop_mode(self):
-        """Switch back to loop mode - stops manual and resumes loop"""
-        with self.playback_control_lock:
-            if not self.manual_mode:
-                logger.info("Already in loop mode")
-                return
-            
-            logger.info("=== SWITCHING TO LOOP MODE ===")
-            
-            # Step 1: Stop manual player if active
-            if self.active_player == self.manual_player and self.manual_player:
-                logger.info("Stopping manual player")
-                self.manual_player.stop()
-                
-                # Wait for manual player to stop
-                timeout = 0
-                while self.manual_player.is_playing() and timeout < 50:
-                    time.sleep(0.1)
-                    timeout += 1
-                
-                if self.manual_player.is_playing():
-                    logger.warning("Manual player didn't stop cleanly")
-                else:
-                    logger.info("Manual player stopped successfully")
-            
-            # Step 2: Switch to loop mode
-            self.manual_mode = False
-            self.active_player = self.loop_player  
-            self.manual_transition_time = 0
-            
-            # Step 3: Resume loop
-            self.loop_pause_event.clear()
-            
-            logger.info("Loop mode resumed")
-    
-    def is_in_manual_mode(self) -> tuple[bool, float]:
-        """Check if in manual mode and return time since transition"""
-        with self.playback_control_lock:
-            if not self.manual_mode:
-                return False, 0
-            
-            time_since_transition = time.time() - self.manual_transition_time
-            return True, time_since_transition
+            return True, in_startup_protection, time_since_start
     
     def send_heartbeat(self):
         """Enhanced heartbeat with status info"""
@@ -243,40 +171,63 @@ class VideoClient:
             self.stats['errors'] += 1
             self.stats['last_error'] = str(e)
     
-    def setup_players(self):
-        """Initialize separate VLC media players"""
+    def setup_player(self):
+        """Initialize VLC media player"""
         try:
-            # Create separate players for different purposes
-            self.loop_player = self.vlc_instance.media_player_new()
-            self.manual_player = self.vlc_instance.media_player_new()
-            
-            # Start in loop mode
-            self.active_player = self.loop_player
-            
-            logger.info("VLC players initialized successfully (loop + manual)")
+            self.player = self.vlc_instance.media_player_new()
+            logger.info("VLC player initialized successfully")
         except Exception as e:
-            logger.error(f"Failed to setup VLC players: {e}")
+            logger.error(f"Failed to setup VLC player: {e}")
             self.stats['errors'] += 1
             self.stats['last_error'] = str(e)
             raise
     
-    def start_playback_on_player(self, player: vlc.MediaPlayer, file_path: str, max_attempts: int = 3) -> bool:
-        """Start VLC playback on specific player with retry logic"""
+    def stop_player_safely(self) -> bool:
+        """Safely stop VLC player with timeout"""
+        if not self.player:
+            return True
+            
+        try:
+            # Stop playback
+            self.player.stop()
+            
+            # Wait for VLC to stop with timeout
+            timeout_count = 0
+            max_timeout = 50  # 5 seconds
+            
+            while timeout_count < max_timeout:
+                state = self.player.get_state()
+                if state in [vlc.State.Stopped, vlc.State.Ended, vlc.State.NothingSpecial]:
+                    logger.debug(f"VLC stopped after {timeout_count * 0.1:.1f}s")
+                    return True
+                    
+                time.sleep(0.1)
+                timeout_count += 1
+            
+            logger.warning("VLC didn't stop cleanly within timeout")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error stopping player: {e}")
+            return False
+    
+    def start_playback(self, file_path: str, max_attempts: int = 3) -> bool:
+        """Start VLC playback with retry logic"""
         for attempt in range(max_attempts):
             try:
-                logger.info(f"Starting playback attempt {attempt + 1}/{max_attempts} on player: {file_path}")
+                logger.info(f"Starting playback attempt {attempt + 1}/{max_attempts}: {file_path}")
                 
                 # Clear any existing media
-                player.set_media(None)
+                self.player.set_media(None)
                 time.sleep(0.1)
                 
                 # Set new media
                 media = self.vlc_instance.media_new(file_path)
-                player.set_media(media)
+                self.player.set_media(media)
                 time.sleep(0.2)
                 
                 # Start playback
-                result = player.play()
+                result = self.player.play()
                 if result == -1:
                     logger.warning(f"VLC play() returned error on attempt {attempt + 1}")
                     time.sleep(0.5)
@@ -285,7 +236,7 @@ class VideoClient:
                 # Wait for playback to start
                 start_timeout = 0
                 while start_timeout < 30:  # 3 second timeout
-                    if player.is_playing():
+                    if self.player.is_playing():
                         logger.info(f"Playback started successfully on attempt {attempt + 1}")
                         return True
                     time.sleep(0.1)
@@ -293,7 +244,7 @@ class VideoClient:
                 
                 logger.warning(f"Playback didn't start on attempt {attempt + 1}")
                 if attempt < max_attempts - 1:
-                    player.stop()
+                    self.stop_player_safely()
                     time.sleep(0.5)
                     
             except Exception as e:
@@ -309,15 +260,15 @@ class VideoClient:
             logger.info(f"=== MANUAL PLAY COMMAND ===")
             logger.info(f"Play command: index={index}, start_time={start_time}, command_id={command_id}")
             
-            # Switch to manual mode FIRST - this stops the loop
-            if not self.switch_to_manual_mode():
-                error_msg = "Failed to switch to manual mode"
-                logger.error(error_msg)
-                self.send_acknowledgment(command_id, "error", error_msg)
-                return
+            # CRITICAL: Set ALL manual flags atomically FIRST
+            with self.manual_control_lock:
+                self.manual_playback_active = True
+                self.manual_start_time = time.time()
+                self.manual_video_playing = False  # Will be set to True when playback starts
+                logger.info("Manual playback control activated - loop should pause immediately")
             
-            # Give time for mode switch to complete
-            time.sleep(1.0)
+            # Give the loop thread time to see the flag change
+            time.sleep(1.5)
             
             self.set_state(PlaybackState.LOADING)
             
@@ -327,7 +278,7 @@ class VideoClient:
                 logger.error(error_msg)
                 self.send_acknowledgment(command_id, "error", error_msg)
                 self.set_state(PlaybackState.ERROR)
-                self.switch_to_loop_mode()  # Return to loop mode on error
+                self._reset_manual_flags()
                 return
             
             file_path = os.path.join(VIDEO_DIR, self.video_files[index])
@@ -338,19 +289,31 @@ class VideoClient:
                 logger.error(error_msg)
                 self.send_acknowledgment(command_id, "error", error_msg)
                 self.set_state(PlaybackState.ERROR)
-                self.switch_to_loop_mode()
+                self._reset_manual_flags()
                 return
             
-            logger.info(f"Starting manual video on dedicated player: {file_path}")
+            logger.info(f"Stopping current playback for manual video: {file_path}")
             
-            # Start playback on manual player
-            if not self.start_playback_on_player(self.manual_player, file_path):
-                error_msg = "Failed to start manual video playback"
+            # Stop current playback (this should stop the loop video)
+            if not self.stop_player_safely():
+                logger.warning("Player didn't stop cleanly, continuing anyway")
+            
+            # Additional wait to ensure VLC is fully stopped
+            time.sleep(1.0)
+            
+            # Start new playback
+            if not self.start_playback(file_path):
+                error_msg = "Failed to start video playback"
                 logger.error(error_msg)
                 self.send_acknowledgment(command_id, "error", error_msg)
                 self.set_state(PlaybackState.ERROR)
-                self.switch_to_loop_mode()
+                self._reset_manual_flags()
                 return
+            
+            # Mark manual video as playing
+            with self.manual_control_lock:
+                self.manual_video_playing = True
+                logger.info("Manual video marked as playing")
             
             # Synchronization
             wait_seconds = start_time - time.time()
@@ -361,27 +324,27 @@ class VideoClient:
                 logger.warning(f"Starting {abs(wait_seconds):.2f}s late")
             
             # Final verification
-            if self.manual_player.is_playing():
+            if self.player.is_playing():
                 self.set_state(PlaybackState.PLAYING)
                 self.current_video_index = index
                 self.stats['videos_played'] += 1
                 success_msg = f"Playing {self.video_files[index]}"
                 self.send_acknowledgment(command_id, "success", success_msg)
-                logger.info(f"Manual video synchronized successfully: {file_path}")
+                logger.info(f"Successfully synchronized: {file_path}")
             else:
-                error_msg = "Manual playback stopped before synchronization"
+                error_msg = "Playback stopped before synchronization"
                 logger.error(error_msg)
                 self.send_acknowledgment(command_id, "error", error_msg)
                 self.set_state(PlaybackState.ERROR)
-                self.switch_to_loop_mode()
+                self._reset_manual_flags()
                 return
             
-            # Monitor manual playback until finished
+            # Monitor playback until finished
             logger.info("=== MONITORING MANUAL PLAYBACK ===")
             playback_start_time = time.time()
             last_log_time = playback_start_time
             
-            while self.manual_player.is_playing():
+            while self.player.is_playing():
                 current_time = time.time()
                 
                 # Log status every 10 seconds
@@ -393,14 +356,14 @@ class VideoClient:
                 time.sleep(1)
             
             total_elapsed = time.time() - playback_start_time
-            logger.info(f"=== MANUAL VIDEO COMPLETED ===")
+            logger.info(f"=== MANUAL VIDEO FINISHED ===")
             logger.info(f"Total playback time: {total_elapsed:.1f}s")
             
-            # Return to loop mode
-            self.switch_to_loop_mode()
+            # Clear manual flags and resume looping
+            self._reset_manual_flags()
             self.set_state(PlaybackState.LOOPING)
             
-            logger.info("Manual playback complete - returning to loop mode")
+            logger.info("Manual playback complete - loop will resume shortly")
             
         except Exception as e:
             error_msg = f"Exception in play_video: {str(e)}"
@@ -409,7 +372,15 @@ class VideoClient:
             self.set_state(PlaybackState.ERROR)
             self.stats['errors'] += 1
             self.stats['last_error'] = str(e)
-            self.switch_to_loop_mode()  # Ensure we return to loop mode
+            self._reset_manual_flags()
+    
+    def _reset_manual_flags(self):
+        """Reset all manual playback flags"""
+        with self.manual_control_lock:
+            self.manual_playback_active = False
+            self.manual_start_time = 0
+            self.manual_video_playing = False
+            logger.info("Manual playback flags reset")
     
     def start_looping(self):
         """Start the looping thread for index 0"""
@@ -419,19 +390,18 @@ class VideoClient:
             
             logger.info("=== LOOP THREAD STARTED ===")
             
-            while self.loop_should_run:
+            while not self.loop_should_stop.is_set():
                 try:
-                    # Wait if paused (manual mode active)
-                    if self.loop_pause_event.is_set():
-                        logger.debug("Loop thread paused (manual mode active)")
-                        time.sleep(2)
-                        continue
+                    # Check if manual playback is active
+                    manual_active, in_protection, time_since_start = self.is_manual_playback_active()
                     
-                    # Double-check we're not in manual mode
-                    in_manual, time_since = self.is_in_manual_mode()
-                    if in_manual:
-                        logger.debug(f"Loop waiting - manual mode active for {time_since:.1f}s")
-                        time.sleep(2)
+                    if manual_active:
+                        if in_protection:
+                            remaining = 10.0 - time_since_start
+                            logger.debug(f"Loop paused - manual video in startup protection ({remaining:.1f}s remaining)")
+                        else:
+                            logger.debug("Loop paused - manual video active")
+                        time.sleep(2)  # Check less frequently during manual playback
                         continue
                     
                     # Check if we have videos
@@ -451,8 +421,8 @@ class VideoClient:
                     
                     self.set_state(PlaybackState.LOOPING)
                     
-                    # Start playback on loop player
-                    if not self.start_playback_on_player(self.loop_player, file_path):
+                    # Start playback
+                    if not self.start_playback(file_path):
                         consecutive_failures += 1
                         logger.error(f"Loop playback failed (failure {consecutive_failures})")
                         
@@ -469,24 +439,20 @@ class VideoClient:
                     self.stats['loop_cycles'] += 1
                     logger.info(f"Loop cycle {self.stats['loop_cycles']} started successfully")
                     
-                    # Monitor loop playback
+                    # Monitor playback with enhanced manual override checking
                     loop_start_time = time.time()
                     last_check_time = loop_start_time
                     
-                    while self.loop_player.is_playing() and self.loop_should_run:
-                        # Check if we need to pause for manual mode
-                        if self.loop_pause_event.is_set():
-                            elapsed = time.time() - loop_start_time
-                            logger.info(f"=== MANUAL MODE REQUESTED ===")
-                            logger.info(f"Stopping loop after {elapsed:.1f}s")
-                            break
+                    while self.player.is_playing() and not self.loop_should_stop.is_set():
+                        # Check for manual override
+                        manual_active, in_protection, _ = self.is_manual_playback_active()
                         
-                        # Double-check manual mode
-                        in_manual, _ = self.is_in_manual_mode()
-                        if in_manual:
+                        if manual_active:
                             elapsed = time.time() - loop_start_time
-                            logger.info(f"=== MANUAL MODE DETECTED ===")
+                            protection_msg = " (startup protection)" if in_protection else ""
+                            logger.info(f"=== MANUAL OVERRIDE DETECTED{protection_msg} ===")
                             logger.info(f"Stopping loop after {elapsed:.1f}s")
+                            self.stop_player_safely()
                             break
                         
                         # Periodic status logging
@@ -496,15 +462,17 @@ class VideoClient:
                             logger.info(f"Loop video playing (elapsed: {elapsed:.1f}s)")
                             last_check_time = current_time
                         
-                        time.sleep(1)
+                        time.sleep(1)  # Check every second for manual override
                     
                     # Check if we should restart the loop
-                    if not self.loop_pause_event.is_set() and not self.is_in_manual_mode()[0] and self.loop_should_run:
+                    manual_active, _, _ = self.is_manual_playback_active()
+                    
+                    if not manual_active and not self.loop_should_stop.is_set():
                         total_time = time.time() - loop_start_time
                         logger.info(f"Loop video ended naturally after {total_time:.1f}s, restarting...")
                         time.sleep(1)  # Brief pause before restart
                     else:
-                        logger.info("Loop stopped - manual mode active or shutdown requested")
+                        logger.info("Loop stopped - manual video control active or shutdown requested")
                         
                 except Exception as e:
                     consecutive_failures += 1
@@ -594,9 +562,9 @@ class VideoClient:
             logger.error("Exiting due to USB mount failure")
             return
         
-        # Load videos and setup players
+        # Load videos and setup player
         self.load_video_files()
-        self.setup_players()
+        self.setup_player()
         
         # Start looping
         self.start_looping()
@@ -618,11 +586,9 @@ class VideoClient:
             logger.error(f"MQTT connection failed: {e}")
         finally:
             self.connected = False
-            self.loop_should_run = False
-            if self.loop_player:
-                self.loop_player.stop()
-            if self.manual_player:
-                self.manual_player.stop()
+            self.loop_should_stop.set()  # Signal loop thread to stop
+            if self.player:
+                self.player.stop()
 
 def main():
     """Main entry point"""
