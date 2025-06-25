@@ -198,8 +198,10 @@ def index():
   buttons.forEach(btn => {{
     btn.addEventListener('click', () => {{
       const now = Date.now();
-      if (now - lastClickTime < 3000) {{
-        showStatus('Please wait before selecting another video', 'warning');
+      // ENHANCED BUTTON DEBOUNCING - 5 second cooldown
+      if (now - lastClickTime < 5000) {{
+        const remaining = Math.ceil((5000 - (now - lastClickTime)) / 1000);
+        showStatus(`Please wait ${{remaining}} more second(s) before selecting another video`, 'warning');
         return;
       }}
       lastClickTime = now;
@@ -207,8 +209,9 @@ def index():
       const index = btn.getAttribute('data-index');
       const videoName = btn.textContent;
       
+      // Disable all buttons immediately
       disableButtons();
-      showStatus(`Starting ${{videoName}}... waiting for clients`, 'warning');
+      showStatus(`Starting ${{videoName}}... sending command to clients`, 'warning');
 
       fetch('/play', {{
         method: 'POST',
@@ -219,6 +222,7 @@ def index():
       .then(data => {{
         if(data.status === 'success') {{
           const commandId = data.command_id;
+          showStatus(`Command sent! Waiting for ${{videoName}} to start on clients...`, 'warning');
           checkCommandStatus(commandId, videoName);
         }} else {{
           showStatus('Error: ' + data.message, 'error');
@@ -234,7 +238,7 @@ def index():
 
   function checkCommandStatus(commandId, videoName) {{
     let attempts = 0;
-    const maxAttempts = 10; // Check for 10 seconds
+    const maxAttempts = 15; // Check for 15 seconds (increased from 10)
     
     const checkInterval = setInterval(() => {{
       attempts++;
@@ -242,27 +246,49 @@ def index():
       fetch(`/command/status/${{commandId}}`)
         .then(resp => resp.json())
         .then(data => {{
+          // Update status message with more detail
+          if (!data.completed) {{
+            const elapsed = Math.floor(data.time_elapsed);
+            const responses = data.total_responses;
+            const expected = data.expected_clients;
+            showStatus(`${{videoName}}: Got ${{responses}}/${{expected}} responses (${{elapsed}}s)`, 'warning');
+          }}
+          
           if (data.completed) {{
             clearInterval(checkInterval);
             enableButtons();
             
             if (data.success_count > 0) {{
-              showStatus(`${{videoName}} started on ${{data.success_count}} client(s)!`, 'success');
+              const successMsg = data.error_count > 0 
+                ? `${{videoName}} started on ${{data.success_count}} client(s), ${{data.error_count}} failed`
+                : `${{videoName}} started successfully on ${{data.success_count}} client(s)!`;
+              
+              showStatus(successMsg, data.error_count > 0 ? 'warning' : 'success');
+              
+              // Only show confetti if at least one client succeeded
               confetti({{
                 particleCount: 150,
                 spread: 60,
                 origin: {{ y: 0.6 }}
               }});
+            }} else if (data.total_responses === 0) {{
+              showStatus(`No clients responded to ${{videoName}} - check client connections`, 'error');
             }} else {{
-              showStatus(`No clients responded to play ${{videoName}}`, 'error');
+              showStatus(`All clients failed to start ${{videoName}}`, 'error');
             }}
           }} else if (attempts >= maxAttempts) {{
             clearInterval(checkInterval);
             enableButtons();
-            showStatus(`Timeout waiting for clients to start ${{videoName}}`, 'error');
+            
+            if (data.total_responses > 0) {{
+              showStatus(`${{videoName}}: Partial success - ${{data.success_count}} clients started`, 'warning');
+            }} else {{
+              showStatus(`Timeout waiting for clients to respond to ${{videoName}}`, 'error');
+            }}
           }}
         }})
         .catch(err => {{
+          console.error('Status check error:', err);
           if (attempts >= maxAttempts) {{
             clearInterval(checkInterval);
             enableButtons();
@@ -296,7 +322,7 @@ def play():
     
     # Create unique command ID
     command_id = f"{int(time.time())}{video_index}"
-    start_time = time.time() + 3  # 3 seconds delay to allow clients to prepare
+    start_time = time.time() + 4  # 4 seconds delay for better preparation time
     
     # Store command for tracking
     with command_lock:
@@ -308,10 +334,34 @@ def play():
             "acks": {}
         }
     
-    # Send command with ID
+    # RETRY LOGIC - Send command multiple times to ensure delivery
     message = f"{video_index},{start_time},{command_id}"
-    mqtt_client.publish(MQTT_TOPIC_PLAY, message, qos=1)
-    print(f"Published play command: {message}")
+    
+    print(f"Sending play command with retries: {message}")
+    
+    # Send message 3 times with slight delays to improve reliability
+    for attempt in range(3):
+        try:
+            result = mqtt_client.publish(MQTT_TOPIC_PLAY, message, qos=1)
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                print(f"MQTT publish attempt {attempt + 1}/3: SUCCESS")
+            else:
+                print(f"MQTT publish attempt {attempt + 1}/3: FAILED (rc={result.rc})")
+        except Exception as e:
+            print(f"MQTT publish attempt {attempt + 1}/3: EXCEPTION {e}")
+        
+        # Small delay between retries (except for last attempt)
+        if attempt < 2:
+            time.sleep(0.2)
+    
+    # Also publish with retain flag to help clients that might reconnect
+    try:
+        mqtt_client.publish(MQTT_TOPIC_PLAY, message, qos=1, retain=True)
+        print("Published with retain flag")
+        # Clear the retained message after a short delay
+        threading.Timer(2.0, lambda: mqtt_client.publish(MQTT_TOPIC_PLAY, "", retain=True)).start()
+    except Exception as e:
+        print(f"Failed to publish with retain: {e}")
     
     return jsonify({"status": "success", "command_id": command_id})
 

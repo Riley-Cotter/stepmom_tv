@@ -79,51 +79,93 @@ def play_video(client, index, start_time, command_id):
 
         print(f"Preparing to play video {file_path} at {start_time}")
 
-        # Stop current playback more gracefully
-        if player.is_playing():
-            player.stop()
-            # Wait for VLC to actually stop
-            timeout = 0
-            while player.get_state() == vlc.State.Playing and timeout < 20:
-                time.sleep(0.1)
-                timeout += 1
-            
-            if timeout >= 20:
-                print("Warning: Player took too long to stop")
+        # IMPROVED VLC STATE MANAGEMENT
+        # Force stop any current playback
+        player.stop()
+        
+        # Wait for VLC to fully stop - check multiple states
+        print("Waiting for VLC to stop...")
+        stop_timeout = 0
+        while stop_timeout < 50:  # 5 second timeout
+            state = player.get_state()
+            if state in [vlc.State.Stopped, vlc.State.Ended, vlc.State.NothingSpecial]:
+                break
+            print(f"VLC state: {state}, waiting...")
+            time.sleep(0.1)
+            stop_timeout += 1
+        
+        if stop_timeout >= 50:
+            print("Warning: VLC didn't stop cleanly, continuing anyway")
+        else:
+            print(f"VLC stopped successfully after {stop_timeout * 0.1:.1f}s")
+
+        # Additional wait for VLC internal cleanup
+        time.sleep(0.3)
+
+        # Clear any existing media
+        player.set_media(None)
+        time.sleep(0.1)
 
         # Set up new media
+        print(f"Loading media: {file_path}")
         media = vlc_instance.media_new(file_path)
         player.set_media(media)
         
-        # Give VLC time to prepare
+        # Wait for media to be set
         time.sleep(0.2)
         
-        # Start playback
-        result = player.play()
-        if result == -1:
-            send_acknowledgment(client, command_id, "error", "VLC play() failed")
+        # Start playback with retry logic
+        play_attempts = 0
+        play_success = False
+        
+        while play_attempts < 3 and not play_success:
+            play_attempts += 1
+            print(f"Play attempt {play_attempts}/3")
+            
+            result = player.play()
+            if result == -1:
+                print(f"VLC play() returned error on attempt {play_attempts}")
+                time.sleep(0.5)
+                continue
+                
+            # Wait for playback to actually start
+            start_timeout = 0
+            while start_timeout < 30:  # 3 second timeout
+                if player.is_playing():
+                    play_success = True
+                    break
+                time.sleep(0.1)
+                start_timeout += 1
+            
+            if not play_success:
+                print(f"Playback didn't start on attempt {play_attempts}")
+                if play_attempts < 3:
+                    player.stop()
+                    time.sleep(0.5)
+        
+        if not play_success:
+            send_acknowledgment(client, command_id, "error", "VLC failed to start playback after 3 attempts")
             with loop_lock:
                 looping_enabled = True
             return
         
-        # Wait a moment for playback to actually start
-        time.sleep(0.5)
+        print(f"Playback started successfully after {play_attempts} attempts")
         
         # Calculate wait time for synchronized start
         wait_seconds = start_time - time.time()
         if wait_seconds > 0:
-            print(f"Waiting {wait_seconds:.2f} seconds to start synchronized...")
+            print(f"Waiting {wait_seconds:.2f} seconds for synchronized start...")
             time.sleep(wait_seconds)
         elif wait_seconds < -1:  # If we're more than 1 second late
             print(f"Warning: Starting {abs(wait_seconds):.2f} seconds late")
 
-        # Verify playback started successfully
+        # Final verification that we're still playing
         if player.is_playing():
             send_acknowledgment(client, command_id, "success", f"Playing {video_files[index]}")
-            print(f"Successfully started playing: {file_path}")
+            print(f"Successfully synchronized and playing: {file_path}")
         else:
-            send_acknowledgment(client, command_id, "error", "Playback failed to start")
-            print("Error: Playback failed to start")
+            send_acknowledgment(client, command_id, "error", "Playback stopped unexpectedly before sync")
+            print("Error: Playback stopped before synchronization")
             with loop_lock:
                 looping_enabled = True
             return
@@ -148,6 +190,9 @@ def play_video(client, index, start_time, command_id):
 def play_looping_index_zero():
     def loop():
         global looping_enabled
+        consecutive_failures = 0
+        max_consecutive_failures = 5
+        
         while True:
             with loop_lock:
                 if not looping_enabled:
@@ -168,31 +213,76 @@ def play_looping_index_zero():
             print(f"[Loop] Playing {file_path}")
             
             try:
+                # IMPROVED LOOPING WITH BETTER VLC HANDLING
+                # Stop any current playback cleanly
+                if player.is_playing():
+                    player.stop()
+                    time.sleep(0.2)
+                
+                # Clear and set new media
+                player.set_media(None)
+                time.sleep(0.1)
+                
                 media = vlc_instance.media_new(file_path)
                 player.set_media(media)
-                player.play()
-                time.sleep(1)
+                time.sleep(0.2)
+                
+                # Try to start playback
+                play_result = player.play()
+                if play_result == -1:
+                    print("[Loop] VLC play() failed")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        print(f"[Loop] Too many consecutive failures ({consecutive_failures}), longer wait")
+                        time.sleep(10)
+                        consecutive_failures = 0
+                    else:
+                        time.sleep(2)
+                    continue
+                
+                # Wait for playback to start
+                start_wait = 0
+                while start_wait < 30 and not player.is_playing():
+                    time.sleep(0.1)
+                    start_wait += 1
+                
+                if not player.is_playing():
+                    print("[Loop] Failed to start playback")
+                    consecutive_failures += 1
+                    time.sleep(2)
+                    continue
+                
+                # Reset failure counter on success
+                consecutive_failures = 0
+                print(f"[Loop] Successfully started playback")
 
+                # Monitor playback
                 while player.is_playing():
                     # Check if we should stop looping
                     with loop_lock:
                         if not looping_enabled:
+                            print("[Loop] Manual video override - stopping loop")
                             break
                     time.sleep(1)
 
                 if looping_enabled:
-                    print("[Loop] Video ended, restarting...")
-                else:
-                    print("[Loop] Stopping loop for manual video")
+                    print("[Loop] Video ended naturally, restarting...")
+                    time.sleep(0.5)  # Brief pause between loops
                     
             except Exception as e:
-                print(f"[Loop] Error playing video: {e}")
-                time.sleep(5)
+                print(f"[Loop] Exception: {e}")
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    print(f"[Loop] Too many failures, waiting longer...")
+                    time.sleep(10)
+                    consecutive_failures = 0
+                else:
+                    time.sleep(5)
 
     global looping_thread
     looping_thread = threading.Thread(target=loop, daemon=True)
     looping_thread.start()
-    print("Started loop of index 0")
+    print("Started improved loop of index 0")
 
 def on_connect(client, userdata, flags, rc):
     print("Connected to MQTT Broker")
