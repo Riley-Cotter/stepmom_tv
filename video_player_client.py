@@ -46,16 +46,18 @@ class VideoClient:
         
         # State management
         self.current_state = PlaybackState.IDLE
-        self.looping_enabled = True
         self.current_video_index = 0
-        self.looping_thread: Optional[threading.Thread] = None
-        self.loop_lock = threading.Lock()
         self.state_lock = threading.Lock()
         
-        # NEW: Manual playback control with startup protection
+        # IMPROVED: Single lock for all manual playback control
+        self.manual_control_lock = threading.Lock()
         self.manual_playback_active = False
-        self.manual_playback_lock = threading.Lock()
-        self.manual_startup_time = 0  # Track when manual playback started
+        self.manual_start_time = 0
+        self.manual_video_playing = False  # NEW: Track if manual video is actually playing
+        
+        # Loop thread control
+        self.looping_thread: Optional[threading.Thread] = None
+        self.loop_should_stop = threading.Event()  # NEW: Clean shutdown signal
         
         # Statistics
         self.stats = {
@@ -73,14 +75,14 @@ class VideoClient:
     def get_status(self) -> dict:
         """Get detailed client status"""
         with self.state_lock:
-            with self.manual_playback_lock:
+            with self.manual_control_lock:
                 return {
                     'client_id': CLIENT_ID,
                     'state': self.current_state.value,
                     'video_count': len(self.video_files),
                     'current_video': self.video_files[self.current_video_index] if self.video_files else None,
-                    'looping_enabled': self.looping_enabled,
                     'manual_playback_active': self.manual_playback_active,
+                    'manual_video_playing': self.manual_video_playing,
                     'is_playing': self.player.is_playing() if self.player else False,
                     'usb_mounted': self.is_usb_mounted(),
                     'uptime': time.time() - self.stats['uptime_start'],
@@ -93,6 +95,19 @@ class VideoClient:
             if self.current_state != new_state:
                 logger.info(f"State change: {self.current_state.value} -> {new_state.value}")
                 self.current_state = new_state
+    
+    def is_manual_playback_active(self) -> tuple[bool, bool, float]:
+        """Check manual playback status with startup protection"""
+        with self.manual_control_lock:
+            if not self.manual_playback_active:
+                return False, False, 0
+            
+            current_time = time.time()
+            time_since_start = current_time - self.manual_start_time
+            # Extended startup protection: 10 seconds instead of 5
+            in_startup_protection = time_since_start < 10.0
+            
+            return True, in_startup_protection, time_since_start
     
     def send_heartbeat(self):
         """Enhanced heartbeat with status info"""
@@ -245,20 +260,15 @@ class VideoClient:
             logger.info(f"=== MANUAL PLAY COMMAND ===")
             logger.info(f"Play command: index={index}, start_time={start_time}, command_id={command_id}")
             
-            # CRITICAL: Set manual playback flag FIRST with timestamp
-            with self.manual_playback_lock:
+            # CRITICAL: Set ALL manual flags atomically FIRST
+            with self.manual_control_lock:
                 self.manual_playback_active = True
-                self.manual_startup_time = time.time()
-                logger.info("Manual playback flag set with startup protection - loop should pause")
+                self.manual_start_time = time.time()
+                self.manual_video_playing = False  # Will be set to True when playback starts
+                logger.info("Manual playback control activated - loop should pause immediately")
             
-            # CRITICAL: Disable looping SECOND
-            with self.loop_lock:
-                was_looping = self.looping_enabled
-                self.looping_enabled = False
-                logger.info(f"Looping disabled (was: {was_looping})")
-            
-            # Give loop thread more time to see the state changes
-            time.sleep(1.0)  # Increased from 0.5 to 1.0 seconds
+            # Give the loop thread time to see the flag change
+            time.sleep(1.5)
             
             self.set_state(PlaybackState.LOADING)
             
@@ -268,13 +278,7 @@ class VideoClient:
                 logger.error(error_msg)
                 self.send_acknowledgment(command_id, "error", error_msg)
                 self.set_state(PlaybackState.ERROR)
-                # Reset flags on error
-                with self.loop_lock:
-                    self.looping_enabled = True
-                with self.manual_playback_lock:
-                    self.manual_playback_active = False
-                    self.manual_startup_time = 0
-                    self.manual_startup_time = 0
+                self._reset_manual_flags()
                 return
             
             file_path = os.path.join(VIDEO_DIR, self.video_files[index])
@@ -285,20 +289,17 @@ class VideoClient:
                 logger.error(error_msg)
                 self.send_acknowledgment(command_id, "error", error_msg)
                 self.set_state(PlaybackState.ERROR)
-                # Reset flags on error
-                with self.loop_lock:
-                    self.looping_enabled = True
-                with self.manual_playback_lock:
-                    self.manual_playback_active = False
+                self._reset_manual_flags()
                 return
             
             logger.info(f"Stopping current playback for manual video: {file_path}")
             
-            # Stop current playback
+            # Stop current playback (this should stop the loop video)
             if not self.stop_player_safely():
                 logger.warning("Player didn't stop cleanly, continuing anyway")
             
-            time.sleep(0.5)  # Additional cleanup time
+            # Additional wait to ensure VLC is fully stopped
+            time.sleep(1.0)
             
             # Start new playback
             if not self.start_playback(file_path):
@@ -306,12 +307,13 @@ class VideoClient:
                 logger.error(error_msg)
                 self.send_acknowledgment(command_id, "error", error_msg)
                 self.set_state(PlaybackState.ERROR)
-                # Reset flags on error
-                with self.loop_lock:
-                    self.looping_enabled = True
-                with self.manual_playback_lock:
-                    self.manual_playback_active = False
+                self._reset_manual_flags()
                 return
+            
+            # Mark manual video as playing
+            with self.manual_control_lock:
+                self.manual_video_playing = True
+                logger.info("Manual video marked as playing")
             
             # Synchronization
             wait_seconds = start_time - time.time()
@@ -334,21 +336,13 @@ class VideoClient:
                 logger.error(error_msg)
                 self.send_acknowledgment(command_id, "error", error_msg)
                 self.set_state(PlaybackState.ERROR)
-                # Reset flags on error
-                with self.loop_lock:
-                    self.looping_enabled = True
-                with self.manual_playback_lock:
-                    self.manual_playback_active = False
+                self._reset_manual_flags()
                 return
             
             # Monitor playback until finished
             logger.info("=== MONITORING MANUAL PLAYBACK ===")
             playback_start_time = time.time()
             last_log_time = playback_start_time
-            
-            # CRITICAL: Give manual video extra startup time before loop can interfere
-            logger.info("Giving manual video 3 seconds of protected startup time...")
-            time.sleep(3.0)
             
             while self.player.is_playing():
                 current_time = time.time()
@@ -364,21 +358,12 @@ class VideoClient:
             total_elapsed = time.time() - playback_start_time
             logger.info(f"=== MANUAL VIDEO FINISHED ===")
             logger.info(f"Total playback time: {total_elapsed:.1f}s")
-            logger.info("Resuming loop in 2 seconds...")
-            time.sleep(2)
             
-            # Clear manual playback flag FIRST
-            with self.manual_playback_lock:
-                self.manual_playback_active = False
-                self.manual_startup_time = 0
-                logger.info("Manual playback flag cleared")
-            
-            # Re-enable looping SECOND
-            with self.loop_lock:
-                self.looping_enabled = True
-                logger.info("Looping re-enabled")
-            
+            # Clear manual flags and resume looping
+            self._reset_manual_flags()
             self.set_state(PlaybackState.LOOPING)
+            
+            logger.info("Manual playback complete - loop will resume shortly")
             
         except Exception as e:
             error_msg = f"Exception in play_video: {str(e)}"
@@ -387,12 +372,15 @@ class VideoClient:
             self.set_state(PlaybackState.ERROR)
             self.stats['errors'] += 1
             self.stats['last_error'] = str(e)
-            # Reset flags on exception
-            with self.manual_playback_lock:
-                self.manual_playback_active = False
-                self.manual_startup_time = 0
-            with self.loop_lock:
-                self.looping_enabled = True
+            self._reset_manual_flags()
+    
+    def _reset_manual_flags(self):
+        """Reset all manual playback flags"""
+        with self.manual_control_lock:
+            self.manual_playback_active = False
+            self.manual_start_time = 0
+            self.manual_video_playing = False
+            logger.info("Manual playback flags reset")
     
     def start_looping(self):
         """Start the looping thread for index 0"""
@@ -402,29 +390,18 @@ class VideoClient:
             
             logger.info("=== LOOP THREAD STARTED ===")
             
-            while True:
+            while not self.loop_should_stop.is_set():
                 try:
-                    # ENHANCED: Check both flags with startup protection
-                    current_time = time.time()
-                    with self.manual_playback_lock:
-                        manual_active = self.manual_playback_active
-                        # Add startup protection - don't interfere for first 5 seconds of manual playback
-                        if manual_active and (current_time - self.manual_startup_time) < 5.0:
-                            startup_remaining = 5.0 - (current_time - self.manual_startup_time)
-                            logger.debug(f"Loop waiting - manual video in startup protection ({startup_remaining:.1f}s remaining)")
-                            time.sleep(1)
-                            continue
+                    # Check if manual playback is active
+                    manual_active, in_protection, time_since_start = self.is_manual_playback_active()
                     
-                    with self.loop_lock:
-                        looping_enabled = self.looping_enabled
-                    
-                    # Wait if manual playback is active OR looping is disabled
-                    if manual_active or not looping_enabled:
-                        if manual_active:
-                            logger.debug("Loop thread waiting (manual playback active)")
-                        if not looping_enabled:
-                            logger.debug("Loop thread waiting (looping disabled)")
-                        time.sleep(1)
+                    if manual_active:
+                        if in_protection:
+                            remaining = 10.0 - time_since_start
+                            logger.debug(f"Loop paused - manual video in startup protection ({remaining:.1f}s remaining)")
+                        else:
+                            logger.debug("Loop paused - manual video active")
+                        time.sleep(2)  # Check less frequently during manual playback
                         continue
                     
                     # Check if we have videos
@@ -462,34 +439,20 @@ class VideoClient:
                     self.stats['loop_cycles'] += 1
                     logger.info(f"Loop cycle {self.stats['loop_cycles']} started successfully")
                     
-                    # Monitor playback with enhanced checking
+                    # Monitor playback with enhanced manual override checking
                     loop_start_time = time.time()
                     last_check_time = loop_start_time
                     
-                    while self.player.is_playing():
-                        # ENHANCED: Check both flags for manual override with startup protection
-                        current_time = time.time()
-                        with self.manual_playback_lock:
-                            manual_active = self.manual_playback_active
-                            # Respect startup protection period
-                            if manual_active and (current_time - self.manual_startup_time) < 5.0:
-                                elapsed = time.time() - loop_start_time
-                                startup_remaining = 5.0 - (current_time - self.manual_startup_time)
-                                logger.info(f"=== MANUAL OVERRIDE DETECTED (STARTUP PROTECTION) ===")
-                                logger.info(f"Startup protection remaining: {startup_remaining:.1f}s")
-                                logger.info(f"Stopping loop after {elapsed:.1f}s")
-                                self.player.stop()  # Explicitly stop the loop video
-                                break
+                    while self.player.is_playing() and not self.loop_should_stop.is_set():
+                        # Check for manual override
+                        manual_active, in_protection, _ = self.is_manual_playback_active()
                         
-                        with self.loop_lock:
-                            looping_enabled = self.looping_enabled
-                        
-                        if manual_active or not looping_enabled:
+                        if manual_active:
                             elapsed = time.time() - loop_start_time
-                            logger.info(f"=== MANUAL OVERRIDE DETECTED ===")
-                            logger.info(f"Manual active: {manual_active}, Looping enabled: {looping_enabled}")
+                            protection_msg = " (startup protection)" if in_protection else ""
+                            logger.info(f"=== MANUAL OVERRIDE DETECTED{protection_msg} ===")
                             logger.info(f"Stopping loop after {elapsed:.1f}s")
-                            self.player.stop()  # Explicitly stop the loop video
+                            self.stop_player_safely()
                             break
                         
                         # Periodic status logging
@@ -499,21 +462,17 @@ class VideoClient:
                             logger.info(f"Loop video playing (elapsed: {elapsed:.1f}s)")
                             last_check_time = current_time
                         
-                        time.sleep(0.5)  # More frequent checking
+                        time.sleep(1)  # Check every second for manual override
                     
-                    # Only restart if both flags allow it
-                    with self.manual_playback_lock:
-                        manual_active = self.manual_playback_active
+                    # Check if we should restart the loop
+                    manual_active, _, _ = self.is_manual_playback_active()
                     
-                    with self.loop_lock:
-                        still_looping = self.looping_enabled
-                    
-                    if not manual_active and still_looping:
+                    if not manual_active and not self.loop_should_stop.is_set():
                         total_time = time.time() - loop_start_time
                         logger.info(f"Loop video ended naturally after {total_time:.1f}s, restarting...")
-                        time.sleep(0.5)
+                        time.sleep(1)  # Brief pause before restart
                     else:
-                        logger.info("Loop stopped - manual video control active")
+                        logger.info("Loop stopped - manual video control active or shutdown requested")
                         
                 except Exception as e:
                     consecutive_failures += 1
@@ -527,6 +486,8 @@ class VideoClient:
                         consecutive_failures = 0
                     else:
                         time.sleep(5)
+            
+            logger.info("Loop thread shutting down")
         
         self.looping_thread = threading.Thread(target=loop_thread, daemon=True)
         self.looping_thread.start()
@@ -625,6 +586,7 @@ class VideoClient:
             logger.error(f"MQTT connection failed: {e}")
         finally:
             self.connected = False
+            self.loop_should_stop.set()  # Signal loop thread to stop
             if self.player:
                 self.player.stop()
 
