@@ -42,7 +42,7 @@ class VideoClient:
     def __init__(self):
         self.video_files: List[str] = []
         self.player: Optional[vlc.MediaPlayer] = None
-        self.vlc_instance = vlc.Instance('--aout=alsa --no-audio --no-video-title')
+        self.vlc_instance = vlc.Instance('--aout=alsa --no-audio --no-video-title --vout=dummy')
         
         # State management
         self.current_state = PlaybackState.IDLE
