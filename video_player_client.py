@@ -176,16 +176,22 @@ class VideoClient:
             logger.info(f"Starting playback: {file_path}")
             
             # Stop current playback if any
-            if self.player.is_playing():
+            if self.player and self.player.is_playing():
                 self.player.stop()
                 time.sleep(0.2)  # Brief pause
             
             # Set new media and play
             media = self.vlc_instance.media_new(file_path)
             self.player.set_media(media)
-            self.player.play()
+            result = self.player.play()
             
-            # Just trust VLC to handle it - no retry logic, no timeout checks
+            # Basic check that play command was accepted
+            if result == -1:
+                logger.error("VLC play() returned error")
+                return False
+            
+            # Brief wait to let VLC start
+            time.sleep(0.3)
             logger.info("Playback command sent to VLC")
             return True
             
@@ -283,11 +289,7 @@ class VideoClient:
                     manual_active, time_since_start = self.is_manual_playback_active()
                     
                     if manual_active:
-                        # Give manual playback some startup time
-                        if time_since_start < 5.0:
-                            logger.debug("Loop paused - manual video starting")
-                        else:
-                            logger.debug("Loop paused - manual video active")
+                        logger.debug(f"Loop paused - manual video active ({time_since_start:.1f}s)")
                         time.sleep(3)
                         continue
                     
@@ -299,39 +301,53 @@ class VideoClient:
                     
                     file_path = os.path.join(VIDEO_DIR, self.video_files[0])
                     
+                    # Check if file exists
+                    if not os.path.exists(file_path):
+                        logger.error(f"Loop video missing: {file_path}")
+                        time.sleep(10)
+                        continue
+                    
                     logger.info(f"Starting loop cycle: {self.video_files[0]}")
                     self.set_state(PlaybackState.LOOPING)
                     
-                    # Start loop video - no fancy error handling
+                    # Start loop video
                     if not self.start_playback_simple(file_path):
                         logger.error("Loop playback failed, retrying in 5s")
                         time.sleep(5)
                         continue
                     
-                    # Give VLC a moment to actually start playing
-                    time.sleep(1)
-                    
                     self.stats['loop_cycles'] += 1
                     logger.info(f"Loop cycle {self.stats['loop_cycles']} started")
                     
-                    # Simple monitoring - wait for video to finish OR manual override
-                    while self.player.is_playing() and not self.loop_should_stop.is_set():
-                        # Check for manual override
-                        manual_active, _ = self.is_manual_playback_active()
-                        if manual_active:
-                            logger.info("Manual override detected - stopping loop")
-                            self.player.stop()
+                    # Monitor playback - let it play through unless manual override
+                    video_playing = True
+                    while video_playing and not self.loop_should_stop.is_set():
+                        try:
+                            # Check if video is still playing
+                            if not self.player or not self.player.is_playing():
+                                logger.info("Loop video finished naturally")
+                                video_playing = False
+                                break
+                            
+                            # Check for manual override
+                            manual_active, _ = self.is_manual_playback_active()
+                            if manual_active:
+                                logger.info("Manual override detected - stopping loop")
+                                if self.player:
+                                    self.player.stop()
+                                video_playing = False
+                                break
+                            
+                            time.sleep(2)  # Check every 2 seconds
+                            
+                        except Exception as e:
+                            logger.error(f"Error during loop monitoring: {e}")
+                            video_playing = False
                             break
-                        
-                        time.sleep(2)  # Check every 2 seconds
                     
-                    # Only restart if video ended naturally (not due to manual override)
-                    manual_active, _ = self.is_manual_playback_active()
-                    if not manual_active and not self.loop_should_stop.is_set():
-                        logger.info("Loop video ended naturally, restarting...")
+                    # Brief pause before next cycle
+                    if not self.loop_should_stop.is_set():
                         time.sleep(1)
-                    else:
-                        logger.info("Loop stopped due to manual override or shutdown")
                         
                 except Exception as e:
                     logger.error(f"Loop exception: {e}")
