@@ -302,9 +302,19 @@ class VideoClient:
                     logger.info(f"Starting loop cycle: {self.video_files[0]}")
                     self.set_state(PlaybackState.LOOPING)
                     
-                    # Start loop video - no fancy error handling
+                    # Start loop video
                     if not self.start_playback_simple(file_path):
                         logger.error("Loop playback failed, retrying in 5s")
+                        time.sleep(5)
+                        continue
+                    # Wait until VLC reports it's actually playing (up to a timeout)
+                    timeout = 5  # seconds
+                    start_wait = time.time()
+                    while not self.player.is_playing() and time.time() - start_wait < timeout:
+                        time.sleep(0.1)
+
+                    if not self.player.is_playing():
+                        logger.warning("VLC never started playback (timeout), retrying")
                         time.sleep(5)
                         continue
                     
