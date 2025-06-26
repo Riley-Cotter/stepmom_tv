@@ -178,7 +178,7 @@ class VideoClient:
             # Stop current playback if any
             if self.player.is_playing():
                 self.player.stop()
-                time.sleep(0.2)  # Brief pause
+                time.sleep(0.5)  # Brief pause
             
             # Set new media and play
             media = self.vlc_instance.media_new(file_path)
